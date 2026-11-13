@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, realpath, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
-  type AgentSession, type ExtensionUIContext,
+  type AgentSession, type ExtensionFactory, type ExtensionUIContext, type SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
 
 export function git(cwd: string, ...args: string[]): string {
@@ -29,14 +29,24 @@ export async function fixture() {
 
 export type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-export async function load(testWorkspace: Fixture, manager = SessionManager.create(testWorkspace.cwd, join(testWorkspace.root, "sessions")), autocomplete?: AutocompleteProvider) {
+interface LoadOptions {
+  autocomplete?: AutocompleteProvider;
+  extensionFactories?: ExtensionFactory[];
+  sessionStartEvent?: SessionStartEvent;
+  mode?: "tui" | "rpc" | "json" | "print";
+  expectedStartupErrors?: number;
+}
+
+export async function load(testWorkspace: Fixture, manager = SessionManager.create(testWorkspace.cwd, join(testWorkspace.root, "sessions")), options: LoadOptions = {}) {
+  let { autocomplete } = options;
+  const { extensionFactories = [], sessionStartEvent } = options;
   process.env.PI_CODING_AGENT_DIR = testWorkspace.agentDir;
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: false }, retry: { enabled: false },
   });
   const resourceLoader = new DefaultResourceLoader({
     cwd: testWorkspace.cwd, agentDir: testWorkspace.agentDir, settingsManager,
-    additionalExtensionPaths: [resolve("src/index.ts")],
+    additionalExtensionPaths: [resolve("src/index.ts")], extensionFactories,
     noExtensions: true, noSkills: true, noThemes: true, noPromptTemplates: true, noContextFiles: true,
   });
   await resourceLoader.reload();
@@ -48,7 +58,7 @@ export async function load(testWorkspace: Fixture, manager = SessionManager.crea
   });
   const { session } = await createAgentSession({
     cwd: testWorkspace.cwd, agentDir: testWorkspace.agentDir, sessionManager: manager,
-    settingsManager, modelRuntime, resourceLoader,
+    settingsManager, modelRuntime, resourceLoader, sessionStartEvent,
   });
   // Fail closed if any test accidentally tries to use a real model.
   session.agent.streamFunction = () => { throw new Error("Unexpected model request"); };
@@ -60,14 +70,17 @@ export async function load(testWorkspace: Fixture, manager = SessionManager.crea
     addAutocompleteProvider(factory) { if (autocomplete) autocomplete = factory(autocomplete); },
   } satisfies ExtensionUIContext;
   const startupLeaf = manager.getLeafId();
-  await session.bindExtensions({ uiContext: ui, mode: autocomplete ? "tui" : "rpc", onError: error => errors.push(error.error) });
-  assert.deepEqual(errors, []);
+  const mode = options.mode ?? (autocomplete ? "tui" : "rpc");
+  await session.bindExtensions({ uiContext: mode === "print" || mode === "json" ? undefined : ui, mode, onError: error => errors.push(error.error) });
+  assert.equal(errors.length, options.expectedStartupErrors ?? 0, errors.join("\n"));
   return {
-    session, manager, notices, startupLeaf, modelRuntime,
+    session, manager, notices, errors, startupLeaf, modelRuntime,
     get autocomplete() { return autocomplete; },
-    async diff(args: Record<string, unknown> = {}) {
-      const tool = session.extensionRunner.getToolDefinition("session_diff");
-      assert.ok(tool, "The loaded extension must register session_diff");
+    async diff(args: Record<string, unknown> = {}) { return this.query("session_diff", args); },
+    async checkpoints() { return this.query("session_checkpoints"); },
+    async query(name: string, args: Record<string, unknown> = {}) {
+      const tool = session.extensionRunner.getToolDefinition(name);
+      assert.ok(tool, `The loaded extension must register ${name}`);
       const context = session.extensionRunner.createToolContext("test-query", undefined);
       const result = await tool.execute("test-query", args, undefined, undefined, context);
       return { ...result, isError: result.isError ?? false };

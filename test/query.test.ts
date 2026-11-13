@@ -71,7 +71,7 @@ test("workspace queries filter exact repository-relative files and reject unsupp
       assert.equal(invalid.isError, true, path);
       assert.equal((invalid.details as any).code, "invalid_request");
     }
-    const unsupported = await app.diff({ scope: "session" });
+    const unsupported = await app.diff({ scope: "unknown" });
     assert.equal(unsupported.isError, true);
     assert.equal((unsupported.details as any).code, "unsupported_scope");
   } finally { dispose(app.session); }

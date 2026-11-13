@@ -1,7 +1,7 @@
 import { getAgentDir, truncateHead, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
-import { diffOutput, diffParameters } from "./tool-contract.ts";
-export type { DiffInput } from "./tool-contract.ts";
+import { checkpointsOutput, checkpointsParameters, diffOutput, diffParameters } from "./tool-contract.ts";
+export type { CheckpointsInput, DiffInput } from "./tool-contract.ts";
 import { SessionFiles, type SessionPosition } from "./session-files.ts";
 import { VersioningError } from "./errors.ts";
 import { isLanguagePreference, Language } from "./language.ts";
@@ -12,10 +12,7 @@ function position(ctx: ExtensionContext): SessionPosition {
     sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd,
     sessionFile: ctx.sessionManager.getSessionFile(),
     leafId: ctx.sessionManager.getLeafId(),
-    branchIds: ctx.sessionManager.getBranch().map(entry => entry.id),
-    entryIds: ctx.sessionManager.getEntries().map(entry => entry.id),
-    hasConversation: ctx.sessionManager.getEntries().some(entry => entry.type === "message" && entry.message.role !== "system" || entry.type === "custom_message"),
-    hasBaselineRecord: ctx.sessionManager.getEntries().some(entry => entry.type === "custom" && entry.customType === "tree-versioning.baseline"),
+    entries: ctx.sessionManager.getEntries(),
   };
 }
 
@@ -45,7 +42,9 @@ export default async function treeVersioning(pi: ExtensionAPI) {
         registerLanguageCommand();
         notify(ctx, language.message("languageSaved", { preference: choice }), "info");
       } catch (error) {
-        notify(ctx, language.message("preferences_failed") + " " + String(error), "error");
+        const message = language.message("preferences_failed") + " " + String(error);
+        if (!ctx.hasUI) throw new Error(message);
+        notify(ctx, message, "error");
       }
     },
   });
@@ -81,54 +80,93 @@ export default async function treeVersioning(pi: ExtensionAPI) {
       }
     } catch (error) {
       const reason = error instanceof VersioningError ? language.message(error.code) : String(error);
-      notify(ctx, language.message("startupFailed", { reason }), "error");
+      const message = language.message("startupFailed", { reason });
+      if (!ctx.hasUI) throw new Error(message);
+      notify(ctx, message, "error");
+    }
+    // Report optional preference failures only after independent file-history initialization.
+    if (preferenceError && !ctx.hasUI) throw new Error(language.message("preferences_failed") + " " + String(preferenceError));
+  });
+  pi.on("agent_settled", async (_event, ctx) => {
+    try {
+      const checkpoint = await files.record(position(ctx));
+      if (!ctx.sessionManager.getBranch().some(entry => entry.id === checkpoint.nodeId)) {
+        throw new VersioningError("storage_failed", "Session left the settled node ancestry during checkpoint collection.");
+      }
+      pi.appendEntry("tree-versioning.checkpoint", checkpoint);
+    } catch (error) {
+      const reason = error instanceof VersioningError ? language.message(error.code) : String(error);
+      const message = language.message("checkpointFailed", { reason });
+      if (!ctx.hasUI) throw new Error(message);
+      notify(ctx, message, "error");
     }
   });
+
+  const queryError = async (error: unknown) => {
+    const rawDiagnostic = error instanceof Error ? error.message : String(error);
+    const diagnostic = truncateHead(rawDiagnostic, { maxBytes: 32 * 1024, maxLines: 1500 });
+    let diagnosticExport: { diagnosticPath: string } | { diagnosticExportFailed: true } | undefined;
+    if (diagnostic.truncated) {
+      try { diagnosticExport = { diagnosticPath: await exportOutput(rawDiagnostic, activeWorkspaceRoot, "diagnostic.txt") }; }
+      catch { diagnosticExport = { diagnosticExportFailed: true }; }
+    }
+    const details = {
+      status: "error" as const,
+      code: error instanceof VersioningError ? error.code : "query_failed" as const,
+      diagnostic: diagnostic.content, diagnosticTruncated: diagnostic.truncated, ...diagnosticExport,
+    };
+    const notice = diagnosticExport && "diagnosticPath" in diagnosticExport
+      ? language.message("diagnosticTruncated", { path: diagnosticExport.diagnosticPath })
+      : diagnosticExport ? language.message("diagnosticExportFailed") : "";
+    const text = language.message(details.code) + "\n" + details.diagnostic + (notice ? "\n" + notice : "");
+    return { isError: true, content: [{ type: "text" as const, text }], details, structuredContent: details };
+  };
+
+  const queryOutput = async (value: unknown, workspaceRoot: string, filename: string, heading: string) => {
+    const fullText = JSON.stringify(value, null, 2);
+    const bounded = truncateHead(fullText);
+    const fullOutputPath = bounded.truncated ? await exportOutput(fullText, workspaceRoot, filename) : undefined;
+    const text = heading + "\n" + bounded.content +
+      (fullOutputPath ? "\n" + language.message("outputTruncated", { path: fullOutputPath }) : "");
+    return { text, fullOutputPath };
+  };
+
+  pi.registerTool({
+    name: "session_checkpoints", get label() { return language.message("checkpointsLabel"); },
+    description: "Read available file checkpoints and native node associations for this session. Output is limited to 2000 lines / 50 KiB; larger catalogs are exported to a private temporary JSON file.",
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    parameters: checkpointsParameters, outputSchema: checkpointsOutput,
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      try {
+        const catalog = await files.checkpoints(position(ctx));
+        const { text, fullOutputPath } = await queryOutput(catalog, catalog.workspaceRoot, "checkpoints.json",
+          language.message("checkpoints", { count: catalog.checkpoints.length }));
+        const { checkpoints: _checkpoints, ...association } = catalog;
+        const details = fullOutputPath ? {
+          ...association, output: { truncated: true as const, fullOutputPath, totalCheckpoints: catalog.checkpoints.length },
+        } : catalog;
+        return { content: [{ type: "text" as const, text }], details, structuredContent: details };
+      } catch (error) { return queryError(error); }
+    },
+  });
+
   pi.registerTool({
     name: "session_diff", get label() { return language.message("diffLabel"); },
-    description: "Read unsnapshotted changes from the session baseline to the disk workspace. Text is limited to 2000 lines / 50 KiB; larger comparisons are exported to a private temporary JSON file, not a checkpoint.",
+    description: "Read round, saved-session, or unsnapshotted workspace differences with explicit endpoints and optional exact file filters. Text is limited to 2000 lines / 50 KiB; larger comparisons are exported to a private temporary JSON file, not a checkpoint.",
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     parameters: diffParameters,
     outputSchema: diffOutput,
     async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        if (params.scope !== undefined && params.scope !== "workspace") {
-          throw new VersioningError("unsupported_scope", "Only workspace comparisons are available.");
-        }
-        const comparison = await files.diff(position(ctx), params.files);
-        const fullText = JSON.stringify(comparison, null, 2);
-        const bounded = truncateHead(fullText);
-        let output: { truncated: true; fullOutputPath: string; totalFiles: number } | undefined;
-        let text = language.message("comparison", { count: comparison.files.length }) + "\n" + bounded.content;
-        if (bounded.truncated) {
-          const fullOutputPath = await exportOutput(fullText, comparison.to.workspaceRoot, "comparison.json");
-          output = { truncated: true, fullOutputPath, totalFiles: comparison.files.length };
-          text += "\n" + language.message("outputTruncated", { path: fullOutputPath });
-        }
+        const comparison = await files.diff(position(ctx), params);
+        const { text, fullOutputPath } = await queryOutput(comparison, comparison.to.workspaceRoot, "comparison.json",
+          language.message("comparison", { scope: comparison.scope, count: comparison.files.length }));
         const { files: _fileChanges, ...comparisonEndpoints } = comparison;
-        const details = output ? { ...comparisonEndpoints, output } : comparison;
+        const details = fullOutputPath ? {
+          ...comparisonEndpoints, output: { truncated: true as const, fullOutputPath, totalFiles: comparison.files.length },
+        } : comparison;
         return { content: [{ type: "text" as const, text }], details, structuredContent: details };
-      } catch (error) {
-        const rawDiagnostic = error instanceof Error ? error.message : String(error);
-        const diagnostic = truncateHead(rawDiagnostic, { maxBytes: 32 * 1024, maxLines: 1500 });
-        let diagnosticExport: { diagnosticPath: string } | { diagnosticExportFailed: true } | undefined;
-        if (diagnostic.truncated) {
-          try { diagnosticExport = { diagnosticPath: await exportOutput(rawDiagnostic, activeWorkspaceRoot, "diagnostic.txt") }; }
-          catch { diagnosticExport = { diagnosticExportFailed: true }; }
-        }
-        const details = {
-          status: "error" as const,
-          code: error instanceof VersioningError ? error.code : "query_failed" as const,
-          diagnostic: diagnostic.content,
-          diagnosticTruncated: diagnostic.truncated,
-          ...diagnosticExport,
-        };
-        const notice = diagnosticExport && "diagnosticPath" in diagnosticExport
-          ? language.message("diagnosticTruncated", { path: diagnosticExport.diagnosticPath })
-          : diagnosticExport ? language.message("diagnosticExportFailed") : "";
-        const text = language.message(details.code) + "\n" + details.diagnostic + (notice ? "\n" + notice : "");
-        return { isError: true, content: [{ type: "text" as const, text }], details, structuredContent: details };
-      }
+      } catch (error) { return queryError(error); }
     },
   });
 }

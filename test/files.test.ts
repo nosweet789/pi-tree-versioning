@@ -3,6 +3,7 @@ import { mkdir, readFile, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { dispose, fixture, git, load } from "./harness.ts";
+import { responseStream, useModel } from "./agent-fixture.ts";
 
 test("symbolic-link targets with non-UTF-8 bytes compare losslessly across reload", async () => {
   const testWorkspace = await fixture();
@@ -82,5 +83,14 @@ test("managed files include tracked ignored paths and preserve binary and link s
     assert.equal(files[1].before.target, join(testWorkspace.root, "outside.txt"));
     assert.equal(files[1].after.target, "missing-target");
     assert.equal(await readFile(join(testWorkspace.root, "outside.txt"), "utf8"), "outside after\n");
+    const head = git(testWorkspace.cwd, "rev-parse", "HEAD");
+    const index = git(testWorkspace.cwd, "ls-files", "--stage");
+    await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
+    await app.session.prompt("Save managed file states.");
+    await app.session.reload();
+    assert.deepEqual(((await app.diff({ scope: "session" })).details as any).files, files);
+    assert.deepEqual(((await app.diff()).details as any).files, []);
+    assert.equal(git(testWorkspace.cwd, "rev-parse", "HEAD"), head);
+    assert.equal(git(testWorkspace.cwd, "ls-files", "--stage"), index);
   } finally { dispose(app.session); }
 });

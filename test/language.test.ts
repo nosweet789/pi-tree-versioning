@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { CombinedAutocompleteProvider } from "@earendil-works/pi-tui";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { dispose, fixture, load } from "./harness.ts";
@@ -12,7 +12,7 @@ test("the existing terminal completion provider updates command help immediately
   const cached = new CombinedAutocompleteProvider([{
     name: "tree-versioning-language", description: "[extension] Choose the tree-versioning language",
   }], testWorkspace.cwd);
-  const app = await load(testWorkspace, undefined, cached);
+  const app = await load(testWorkspace, undefined, { autocomplete: cached });
   try {
     const existing = app.autocomplete!;
     const input = "/tree-versioning-l";
@@ -26,6 +26,24 @@ test("the existing terminal completion provider updates command help immediately
     assert.match((await suggestions())!.items[0].description!, /Choose/);
   } finally { dispose(app.session); }
 });
+
+for (const mode of ["print", "json"] as const) {
+  test(`${mode} reports unreadable preferences without blocking baseline initialization`, async () => {
+    const testWorkspace = await fixture();
+    const storage = join(testWorkspace.agentDir, "tree-versioning");
+    await mkdir(storage);
+    await writeFile(join(storage, "preferences.json"), "{invalid");
+    const app = await load(testWorkspace, undefined, { mode, expectedStartupErrors: 1 });
+    try {
+      assert.match(app.errors[0], /language preference/);
+      const catalog = await app.checkpoints();
+      assert.equal(catalog.isError, false, JSON.stringify(catalog));
+      assert.equal((catalog.details as any).baseline.kind, "baseline");
+      assert.deepEqual(((await app.diff({ scope: "session" })).details as any).files, []);
+      assert.deepEqual(app.notices, []);
+    } finally { dispose(app.session); }
+  });
+}
 
 test("auto recognizes supported system locales and falls back to English for unsupported locales", async () => {
   const previous = process.env.LC_ALL;
