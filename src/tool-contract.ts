@@ -52,11 +52,13 @@ const endpoints = {
   to: Type.Union([baselineEndpoint, checkpointEndpoint, Type.Object({ kind: Type.Literal("workspace"), workspaceRoot: Type.String() })]),
 };
 
+export const comparisonOutput = Type.Object({
+  status: Type.Literal("ok"), scope: StringEnum(["workspace", "turn", "session"]), ...endpoints,
+  files: Type.Array(fileChange),
+});
+
 export const diffOutput = Type.Union([
-  Type.Object({
-    status: Type.Literal("ok"), scope: StringEnum(["workspace", "turn", "session"]), ...endpoints,
-    files: Type.Array(fileChange),
-  }),
+  comparisonOutput,
   Type.Object({
     status: Type.Literal("ok"), scope: StringEnum(["workspace", "turn", "session"]), ...endpoints,
     output: Type.Object({ truncated: Type.Literal(true), fullOutputPath: Type.String(), totalFiles: Type.Integer() }),

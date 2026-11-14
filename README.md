@@ -8,10 +8,12 @@ Development build for **@earendil-works/pi-coding-agent 1.5.2**. No public packa
 - Save a file checkpoint when a complete processing round settles, including interruption and error stops. Parallel tools, steering, queued inputs, automatic retries, and recovery continuations remain part of that round.
 - List checkpoints and their native session-node associations with the read-only `session_checkpoints` tool.
 - Query round, saved-session, or unsnapshotted workspace differences with the read-only `session_diff` tool.
+- Display persistent round-diff cards with file statistics and expandable text, without adding them to model context.
+- Open `/tree-versioning-diff` to inspect the current branch\'s saved session diff without changing files or history.
 - Preserve file history across reloads, reopening, and session switching. Opening a session never restores or overwrites project files.
 - Select English or Simplified Chinese extension messages with `/tree-versioning-language en`, `zh-CN`, or `auto`.
 
-**Not implemented yet:** diff cards, a user-facing total-diff viewer, file restoration, and fork/clone inheritance. Do not use this development slice as a backup or assume that tree navigation restores files. Forks/clones with copied baseline metadata currently report unavailable history rather than inventing inherited snapshots.
+**Not implemented yet:** file restoration and fork/clone inheritance. Do not use this development slice as a backup or assume that tree navigation restores files. Forks/clones with copied baseline metadata currently report unavailable history rather than inventing inherited snapshots.
 
 ## Local development
 
@@ -25,6 +27,18 @@ pi -e ./src/index.ts
 Run the last command from a Git workspace, supplying an absolute extension path when needed. This temporary loading does not add an installation declaration to pi settings.
 
 Verified locally with Node.js 26.5.0, Git 2.50.1, and pi 1.5.2 on macOS. The integration tests use real temporary Git repositories and pi session implementations, including a deterministic agent/tool run; they do not call external models. Tests isolate HOME, pi data, Git configuration, caches, and temporary output. POSIX symbolic links and `mkfifo` are used in safety tests. Other platforms and host versions have not been verified; peer dependency `"*"` ranges are the host's assembly convention, not a compatibility claim.
+
+## Diff cards and viewer
+
+Each newly recorded round stores its semantic comparison in the same context-invisible session entry as the checkpoint association. Cards show the actual baseline/checkpoint IDs, native checkpoint nodes, file list, and text additions/deletions. Binary files show their change status, never a text patch. An unchanged round explicitly shows no file changes.
+
+Use pi's configured **expand tool output** action (default **Ctrl+O**) to expand or collapse card patches. `/tree-versioning-diff` opens a read-only, scrollable overlay for the session baseline → current branch's saved state. It excludes later disk edits and other branches. The viewer uses the configured expand, up/down, page-up/page-down, and cancel actions (defaults **Ctrl+O**, arrows, **Page Up/Page Down**, **Escape**). `/tree-versioning-diff help` explains the comparison. Viewing does not append a session entry, capture files, change the native position, or start a model request.
+
+The viewer needs interactive terminal mode; RPC, print, and JSON modes report that limitation and point to `session_diff` with `scope: "session"`. Automatic cards are still saved in those modes. Queries validate the required snapshots and report missing, corrupt, or uncovered history rather than showing an empty comparison. If recording succeeds but its predecessor cannot be compared, the checkpoint has a durable localized error card, not a false capture-failure or empty-diff message.
+
+Historical cards replay the comparison saved at capture time; they do not revalidate snapshot availability or include subsequent disk changes. Their semantic data survives reloads and reopening and renders in the current language and theme. Older checkpoints recorded before card support have no saved display data; their cards report that limitation, while available snapshots remain queryable. Native branch and compaction visibility rules still apply.
+
+Paths and patches are not translated. Terminal control bytes are visibly escaped so file content cannot execute terminal instructions; ordinary line breaks and tabs in patches are laid out by the host. Text wraps by terminal columns, and expanded content remains reachable by scrolling. Complete comparisons are stored in the session, so large diffs increase session size. Review session exports before sharing: cards can contain source text even though they are excluded from model context.
 
 ## Query contract
 

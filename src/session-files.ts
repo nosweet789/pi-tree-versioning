@@ -7,7 +7,7 @@ import { link, lstat, mkdir, open, readlink, realpath, rm, writeFile } from "nod
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { promisify } from "node:util";
 import { formatPatch, structuredPatch } from "diff";
-import { VersioningError } from "./errors.ts";
+import { VersioningError, type ErrorCode } from "./errors.ts";
 import { canonicalLocation, isWithin } from "./paths.ts";
 
 const exec = promisify(execFile);
@@ -19,6 +19,11 @@ export interface SessionPosition {
   leafId: string | null;
   entries: readonly SessionEntry[];
 }
+
+interface ComparisonRequest { scope?: string; checkpointId?: string; files?: string[] }
+export type RecordedDiff = Awaited<ReturnType<SessionFiles["diff"]>> | {
+  status: "error"; checkpointId: string; code: ErrorCode;
+};
 
 type FileState = { kind: "file"; content: string; executable: boolean } |
   { kind: "symlink"; target: string; targetEncoding: "utf8" | "base64" };
@@ -301,7 +306,13 @@ export class SessionFiles {
     } catch (error) {
       throw new VersioningError("storage_failed", String(error));
     }
-    return checkpoint;
+    let comparison: RecordedDiff;
+    try { comparison = await this.compare(position, { scope: "turn" }, snapshot); }
+    catch (error) {
+      comparison = { status: "error", checkpointId: checkpoint.id,
+        code: error instanceof VersioningError ? error.code : "query_failed" };
+    }
+    return { checkpoint, comparison };
   }
 
   private checkpointRecords(position: SessionPosition): Checkpoint[] {
@@ -384,7 +395,11 @@ export class SessionFiles {
     return branch.reverse();
   }
 
-  async diff(position: SessionPosition, request: { scope?: string; checkpointId?: string; files?: string[] } = {}) {
+  async diff(position: SessionPosition, request: ComparisonRequest = {}) {
+    return this.compare(position, request);
+  }
+
+  private async compare(position: SessionPosition, request: ComparisonRequest, recorded?: CheckpointSnapshot) {
     const { scope = "workspace", checkpointId, files: requestedFiles } = request;
     if (scope !== "workspace" && scope !== "turn" && scope !== "session") {
       throw new VersioningError("unsupported_scope", "Expected workspace, turn, or session scope.");
@@ -402,7 +417,7 @@ export class SessionFiles {
     const snapshot = await this.load(position);
     const records = this.checkpointRecords(position);
     const currentBranch = this.branchAt(position, position.leafId);
-    const checkpoint = checkpointId === undefined ? this.nearestCheckpoint(records, currentBranch) : records.find(record => record.id === checkpointId);
+    const checkpoint = recorded?.checkpoint ?? (checkpointId === undefined ? this.nearestCheckpoint(records, currentBranch) : records.find(record => record.id === checkpointId));
     if (scope === "turn" && !checkpoint) {
       throw new VersioningError("no_checkpoint", "No recorded round matches the requested checkpoint or current ancestry.");
     }
@@ -415,7 +430,8 @@ export class SessionFiles {
       return { endpoint: this.checkpointEndpoint(savedSnapshot), files: savedSnapshot.files };
     };
     const branch = checkpoint ? this.branchAt(position, checkpoint.nodeId) : currentBranch;
-    const target = checkpoint ? await saved(checkpoint) : baselineAt(branch);
+    const target = recorded ? { endpoint: this.checkpointEndpoint(recorded), files: recorded.files } :
+      checkpoint ? await saved(checkpoint) : baselineAt(branch);
     const previous = scope === "turn" ? this.nearestCheckpoint(records, branch.slice(0, -1)) : undefined;
     const source = scope === "workspace" ? target : scope === "turn" && previous ? await saved(previous) : baselineAt(branch);
     const current = scope === "workspace" ? await capture(snapshot.workspaceRoot) : target.files;

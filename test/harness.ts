@@ -35,6 +35,7 @@ interface LoadOptions {
   sessionStartEvent?: SessionStartEvent;
   mode?: "tui" | "rpc" | "json" | "print";
   expectedStartupErrors?: number;
+  custom?: ExtensionUIContext["custom"];
 }
 
 export async function load(testWorkspace: Fixture, manager = SessionManager.create(testWorkspace.cwd, join(testWorkspace.root, "sessions")), options: LoadOptions = {}) {
@@ -67,6 +68,7 @@ export async function load(testWorkspace: Fixture, manager = SessionManager.crea
   const ui = {
     ...session.extensionRunner.getUIContext(),
     notify(message: string, type?: string) { notices.push({ message, type }); },
+    ...(options.custom ? { custom: options.custom } : {}),
     addAutocompleteProvider(factory) { if (autocomplete) autocomplete = factory(autocomplete); },
   } satisfies ExtensionUIContext;
   const startupLeaf = manager.getLeafId();

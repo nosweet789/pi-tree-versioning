@@ -9,21 +9,26 @@ import { zhCN } from "../src/locales/zh-CN.ts";
 
 test("the existing terminal completion provider updates command help immediately after a language change", async () => {
   const testWorkspace = await fixture();
-  const cached = new CombinedAutocompleteProvider([{
-    name: "tree-versioning-language", description: "[extension] Choose the tree-versioning language",
-  }], testWorkspace.cwd);
+  const cached = new CombinedAutocompleteProvider([
+    { name: "tree-versioning-language", description: "[extension] Choose the tree-versioning language" },
+    { name: "tree-versioning-diff", description: "[extension] View the current branch's saved session diff" },
+  ], testWorkspace.cwd);
   const app = await load(testWorkspace, undefined, { autocomplete: cached });
   try {
     const existing = app.autocomplete!;
     const input = "/tree-versioning-l";
     const suggestions = () => existing.getSuggestions([input], 0, input.length, { signal: new AbortController().signal });
+    const diffInput = "/tree-versioning-d";
+    const diffSuggestions = () => existing.getSuggestions([diffInput], 0, diffInput.length, { signal: new AbortController().signal });
     assert.match((await suggestions())!.items[0].description!, /Choose/);
     await app.command("zh-CN");
     assert.equal(app.autocomplete, existing);
     assert.match((await suggestions())!.items[0].description!, /^\[extension\] .*语言/);
     assert.equal((await suggestions())!.items[0].value, "tree-versioning-language");
+    assert.match((await diffSuggestions())!.items[0].description!, /会话总差异/);
     await app.command("en");
     assert.match((await suggestions())!.items[0].description!, /Choose/);
+    assert.match((await diffSuggestions())!.items[0].description!, /saved session diff/);
   } finally { dispose(app.session); }
 });
 

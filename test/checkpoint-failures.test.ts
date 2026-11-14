@@ -41,6 +41,8 @@ test("unchanged rounds have checkpoints but incomplete collection never publishe
     await app.command("zh-CN");
     await app.session.prompt("Collection will fail.");
     assert.match(app.notices.at(-1)!.message, /本轮未记录/);
+    assert.equal(app.manager.getEntries().filter(entry => entry.type === "custom" &&
+      app.session.extensionRunner.getEntryRenderer(entry.customType)).length, 1);
     assert.deepEqual(((await app.checkpoints()).details as any).checkpoints, initial);
     const failed = await app.diff();
     assert.equal(failed.isError, true);

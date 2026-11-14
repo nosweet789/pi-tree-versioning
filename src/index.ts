@@ -6,6 +6,7 @@ import { SessionFiles, type SessionPosition } from "./session-files.ts";
 import { VersioningError } from "./errors.ts";
 import { isLanguagePreference, Language } from "./language.ts";
 import { exportOutput } from "./tool-output.ts";
+import { diffView, showDiff } from "./diff-view.ts";
 
 function position(ctx: ExtensionContext): SessionPosition {
   return {
@@ -20,6 +21,12 @@ function notify(ctx: ExtensionContext, message: string, type: "info" | "error") 
   if (ctx.hasUI) ctx.ui.notify(message, type);
 }
 
+// Unlike informational notifications, failures must also reach the non-UI host error channel.
+function reportError(ctx: ExtensionContext, message: string) {
+  if (!ctx.hasUI) throw new Error(message);
+  ctx.ui.notify(message, "error");
+}
+
 export default async function treeVersioning(pi: ExtensionAPI) {
   const storage = join(getAgentDir(), "tree-versioning");
   const files = new SessionFiles(storage);
@@ -28,6 +35,27 @@ export default async function treeVersioning(pi: ExtensionAPI) {
   let preferenceError: unknown;
   try { await language.load(); } catch (error) { preferenceError = error; }
 
+  const registerDiffCommand = () => pi.registerCommand("tree-versioning-diff", {
+    description: language.message("diffCommand"),
+    handler: async (args, ctx) => {
+      if (args.trim()) {
+        notify(ctx, language.message("diffHelp"), "info");
+        return;
+      }
+      if (ctx.mode !== "tui") {
+        reportError(ctx, language.message("viewerRequiresTui"));
+        return;
+      }
+      try {
+        const comparison = await files.diff(position(ctx), { scope: "session" });
+        await showDiff(comparison, language, ctx);
+      } catch (error) {
+        const reason = error instanceof VersioningError ? language.message(error.code) : language.message("query_failed") + " " + String(error);
+        notify(ctx, reason, "error");
+      }
+    },
+  });
+  registerDiffCommand();
   const registerLanguageCommand = () => pi.registerCommand("tree-versioning-language", {
     description: language.message("languageCommand"),
     getArgumentCompletions: prefix => ["en", "zh-CN", "auto"].filter(value => value.startsWith(prefix)).map(value => ({ value, label: value })),
@@ -40,19 +68,23 @@ export default async function treeVersioning(pi: ExtensionAPI) {
       try {
         await language.save(choice);
         registerLanguageCommand();
+        registerDiffCommand();
         notify(ctx, language.message("languageSaved", { preference: choice }), "info");
       } catch (error) {
-        const message = language.message("preferences_failed") + " " + String(error);
-        if (!ctx.hasUI) throw new Error(message);
-        notify(ctx, message, "error");
+        reportError(ctx, language.message("preferences_failed") + " " + String(error));
       }
     },
   });
   registerLanguageCommand();
+  pi.registerEntryRenderer<{ diff?: unknown }>("tree-versioning.checkpoint", (entry, options, theme) =>
+    diffView(entry.data?.diff, language, options, theme));
   pi.on("session_start", async (_event, ctx) => {
     if (ctx.mode === "tui") {
       ctx.ui.addAutocompleteProvider(current => {
-        const cachedDescription = language.message("languageCommand");
+        const descriptions = ([
+          { name: "tree-versioning-language", key: "languageCommand" },
+          { name: "tree-versioning-diff", key: "diffCommand" },
+        ] as const).map(({ name, key }) => ({ name, key, cached: language.message(key) }));
         return {
           triggerCharacters: current.triggerCharacters,
           async getSuggestions(lines, cursorLine, cursorCol, options) {
@@ -60,9 +92,11 @@ export default async function treeVersioning(pi: ExtensionAPI) {
             if (!suggestions?.prefix.startsWith("/") || suggestions.prefix.includes(" ")) return suggestions;
             return {
               ...suggestions,
-              items: suggestions.items.map(item => /^tree-versioning-language(?::\d+)?$/.test(item.value)
-                ? { ...item, description: item.description?.replace(cachedDescription, language.message("languageCommand")) }
-                : item),
+              items: suggestions.items.map(item => {
+                const description = descriptions.find(value => value.name === item.value.replace(/:\d+$/, ""));
+                return description ? { ...item, description: item.description?.replace(description.cached,
+                  language.message(description.key)) } : item;
+              }),
             };
           },
           applyCompletion: (...args) => current.applyCompletion(...args),
@@ -80,25 +114,28 @@ export default async function treeVersioning(pi: ExtensionAPI) {
       }
     } catch (error) {
       const reason = error instanceof VersioningError ? language.message(error.code) : String(error);
-      const message = language.message("startupFailed", { reason });
-      if (!ctx.hasUI) throw new Error(message);
-      notify(ctx, message, "error");
+      reportError(ctx, language.message("startupFailed", { reason }));
     }
     // Report optional preference failures only after independent file-history initialization.
     if (preferenceError && !ctx.hasUI) throw new Error(language.message("preferences_failed") + " " + String(preferenceError));
   });
   pi.on("agent_settled", async (_event, ctx) => {
+    let recorded: Awaited<ReturnType<SessionFiles["record"]>>;
     try {
-      const checkpoint = await files.record(position(ctx));
+      recorded = await files.record(position(ctx));
+      const { checkpoint, comparison } = recorded;
       if (!ctx.sessionManager.getBranch().some(entry => entry.id === checkpoint.nodeId)) {
         throw new VersioningError("storage_failed", "Session left the settled node ancestry during checkpoint collection.");
       }
-      pi.appendEntry("tree-versioning.checkpoint", checkpoint);
+      // One publication keeps the association and its display on the same native branch.
+      pi.appendEntry("tree-versioning.checkpoint", { ...checkpoint, diff: comparison });
     } catch (error) {
       const reason = error instanceof VersioningError ? language.message(error.code) : String(error);
-      const message = language.message("checkpointFailed", { reason });
-      if (!ctx.hasUI) throw new Error(message);
-      notify(ctx, message, "error");
+      reportError(ctx, language.message("checkpointFailed", { reason }));
+      return;
+    }
+    if (recorded.comparison.status === "error") {
+      reportError(ctx, language.message("diffFailed", { reason: language.message(recorded.comparison.code) }));
     }
   });
 

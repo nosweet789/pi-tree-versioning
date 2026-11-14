@@ -5,6 +5,34 @@ import { test } from "node:test";
 import { dispose, fixture, load } from "./harness.ts";
 import { responseStream, useModel } from "./agent-fixture.ts";
 
+test("automatic cards remain outside actual model requests across language changes and reloads", async () => {
+  const workspace = await fixture();
+  const app = await load(workspace);
+  try {
+    const requests: unknown[] = [];
+    const respond: Parameters<typeof useModel>[1] = (_model, context) => {
+      requests.push(context.messages);
+      return responseStream({ content: [{ type: "text", text: "Done." }] });
+    };
+    await useModel(app, respond);
+    await writeFile(join(workspace.cwd, "notes.txt"), "AUTOMATIC-CARD-ONLY-CONTENT\n");
+    await app.session.prompt("Record a change without querying.");
+    const visibleCards = () => app.manager.getEntries().filter(entry =>
+      entry.type === "custom" && !!app.session.extensionRunner.getEntryRenderer(entry.customType));
+    assert.equal(visibleCards().length, 1);
+    assert.match(JSON.stringify(visibleCards()), /AUTOMATIC-CARD-ONLY-CONTENT/);
+    await app.command("zh-CN");
+    await app.session.prompt("/tree-versioning-diff help");
+    await app.session.reload();
+    await useModel(app, respond);
+    await app.session.prompt("Continue without reading files.");
+    assert.equal(requests.length, 2);
+    assert.doesNotMatch(JSON.stringify(requests), /AUTOMATIC-CARD-ONLY-CONTENT|tree-versioning\.(baseline|checkpoint|diff)/);
+    assert.equal(visibleCards().length, 2);
+    assert.equal(((await app.checkpoints()).details as any).checkpoints.length, 2);
+  } finally { dispose(app.session); }
+});
+
 test("both read-only tools reach model context while automatic file history records do not", async () => {
   const testWorkspace = await fixture();
   const app = await load(testWorkspace);
@@ -31,7 +59,7 @@ test("both read-only tools reach model context while automatic file history reco
     assert.equal(((await app.checkpoints()).details as any).checkpoints.length, 1);
     await app.session.prompt("Continue without querying.");
     assert.equal(requests.length, 3);
-    assert.doesNotMatch(JSON.stringify(requests), /tree-versioning\.(baseline|checkpoint)/);
+    assert.doesNotMatch(JSON.stringify(requests), /tree-versioning\.(baseline|checkpoint|diff)/);
     assert.equal(((await app.checkpoints()).details as any).checkpoints.length, 2);
     assert.deepEqual(app.session.getActiveToolNames().sort(), ["read", "bash", "edit", "write", "session_diff", "session_checkpoints"].sort());
   } finally { dispose(app.session); }
