@@ -1,9 +1,9 @@
-import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { SessionEntry, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { isUtf8 } from "node:buffer";
 import { execFile } from "node:child_process";
 import { constants, lstatSync, mkdirSync, readdirSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { link, lstat, mkdir, open, readlink, realpath, rm, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, open, readlink, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { promisify } from "node:util";
 import { formatPatch, structuredPatch } from "diff";
@@ -38,6 +38,7 @@ interface FileSnapshot {
 interface Snapshot extends FileSnapshot {
   baseline: { id: string; capturedAt: string; anchorId: string | null };
   priorEntryIds: string[];
+  inheritedCheckpoints?: Checkpoint[];
 }
 
 interface Checkpoint {
@@ -76,7 +77,8 @@ function parseSnapshot(text: string, kind: "baseline" | "checkpoint"): Snapshot 
       (kind === "checkpoint" ? !isCheckpoint(value.checkpoint) :
         typeof value.baseline?.id !== "string" || typeof value.baseline?.capturedAt !== "string" ||
         !(value.baseline.anchorId === null || typeof value.baseline.anchorId === "string") ||
-        !Array.isArray(value.priorEntryIds) || !value.priorEntryIds.every((id: unknown) => typeof id === "string"))) {
+        !Array.isArray(value.priorEntryIds) || !value.priorEntryIds.every((id: unknown) => typeof id === "string") ||
+        value.inheritedCheckpoints !== undefined && (!Array.isArray(value.inheritedCheckpoints) || !value.inheritedCheckpoints.every(isCheckpoint)))) {
     throw new Error("Invalid snapshot data or integrity checksum");
   }
   for (const [path, state] of Object.entries(value.files) as [string, FileState][]) {
@@ -300,8 +302,10 @@ function applySnapshot(root: string, current: Record<string, FileState>, target:
   }
 }
 
-/** Owns file collection, persistence, history coverage, comparisons, and restoration. */
+/** Owns file collection, persistence, history coverage, comparisons, restoration, and inheritance. */
 export class SessionFiles {
+  private forkAttempt?: { sessionId: string; token: string };
+
   constructor(private readonly storageDir: string) {}
 
   private path(sessionId: string, filename: string) {
@@ -322,11 +326,11 @@ export class SessionFiles {
     return path;
   }
 
-  private async readSnapshot(path: string) {
-    if (!(await lstat(path)).isFile()) throw new Error("Snapshot is not a regular file");
+  private async readRegularFile(path: string) {
+    if (!(await lstat(path)).isFile()) throw new Error("Stored data is not a regular file");
     const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     try {
-      if (!(await handle.stat()).isFile()) throw new Error("Snapshot is not a regular file");
+      if (!(await handle.stat()).isFile()) throw new Error("Stored data is not a regular file");
       return await handle.readFile("utf8");
     } finally { await handle.close(); }
   }
@@ -351,12 +355,71 @@ export class SessionFiles {
     }
   }
 
-  async initialize(position: SessionPosition) {
+  async prepareFork(position: SessionPosition, entryId: string, forkPosition: "before" | "at") {
+    this.forkAttempt = undefined;
+    await this.assertExternalPersistence(position, await workspaceRoot(position.cwd));
+    if (!position.sessionFile) await rm(this.transferPath(undefined, position.cwd), { force: true });
+    const token = randomUUID();
+    const path = await this.storagePath(position.sessionId, true, "fork-" + token + ".json");
+    await writeFile(path, JSON.stringify({ sessionId: position.sessionId, entryId, position: forkPosition }), { flag: "wx", mode: 0o600 });
+    this.forkAttempt = { sessionId: position.sessionId, token };
+  }
+
+  async finishFork(position: SessionPosition, targetSessionFile?: string) {
+    const attempt = this.forkAttempt;
+    this.forkAttempt = undefined;
+    if (!attempt || attempt.sessionId !== position.sessionId) return;
+    const source = await this.storagePath(position.sessionId, false, "fork-" + attempt.token + ".json");
+    const intent = JSON.parse(await this.readRegularFile(source));
+    const destination = this.transferPath(targetSessionFile, position.cwd);
+    const temporary = destination + "." + attempt.token + ".tmp";
+    try {
+      // Persist the settled source tree as well as intent. Ephemeral sessions have no
+      // JSONL source, and the host mutates their manager after this shutdown hook.
+      await writeFile(temporary, JSON.stringify({ source: position, intent, targetSessionFile }), { flag: "wx", mode: 0o600 });
+      await rename(temporary, destination);
+      await rm(source);
+    } finally { await rm(temporary, { force: true }); }
+  }
+
+  private transferPath(sessionFile: string | undefined, cwd: string) {
+    // Native pi owns one active runtime per process. File-backed replacements have
+    // a unique target path; an ephemeral replacement uses a one-shot process slot.
+    const identity = sessionFile ?? JSON.stringify({ processId: process.pid, cwd });
+    return join(this.storageDir, "transfer-" + createHash("sha256").update(identity).digest("hex") + ".json");
+  }
+
+  async initialize(position: SessionPosition, reason: SessionStartEvent["reason"] = "startup") {
     const root = await workspaceRoot(position.cwd);
     await this.assertExternalPersistence(position, root);
+    const fork = reason === "fork";
+    // A replacement can fail before its origin marker is writable. Its durable
+    // receipt still distinguishes it from a new session when later reopened.
+    const receipt = reason !== "new" && (fork || position.sessionFile || reason === "reload") &&
+      await lstat(this.transferPath(position.sessionFile, position.cwd)).catch(error => {
+        if (error.code !== "ENOENT") throw error;
+        return undefined;
+      });
+    let restore = false;
+    if (fork || receipt) {
+      await mkdir(this.storageDir, { recursive: true, mode: 0o700 });
+      if (!(await lstat(this.storageDir)).isDirectory()) throw new Error("Snapshot storage must not traverse symbolic links");
+      // Record the origin before touching the child directory, which may be obstructed.
+      // This also covers an empty native copy with no baseline association entry.
+      await writeFile(this.path(position.sessionId, "") + ".origin.json", JSON.stringify({ inherited: true }), { flag: "wx", mode: 0o600 }).catch(error => {
+        if (error.code !== "EEXIST") throw error;
+      });
+      if (!await lstat(this.path(position.sessionId, "baseline.json")).catch(error => {
+        if (error.code !== "ENOENT") throw error;
+        return undefined;
+      })) {
+        const restoreRequested = await this.inherit(position, root);
+        restore = fork && restoreRequested;
+      }
+    }
     try {
       const existing = await this.load(position);
-      return { baseline: existing.baseline, created: !this.hasBaselineRecord(position), workspaceRoot: root };
+      return { baseline: existing.baseline, created: !existing.inheritedCheckpoints && !fork && !this.hasBaselineRecord(position), workspaceRoot: root, restore };
     } catch (error) {
       if (!(error instanceof VersioningError) || error.code !== "no_baseline") throw error;
     }
@@ -375,22 +438,97 @@ export class SessionFiles {
       try { await this.publishSnapshot(path, snapshot); }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        return { baseline: (await this.load(position)).baseline, created: !this.hasBaselineRecord(position), workspaceRoot: root };
+        return { baseline: (await this.load(position)).baseline, created: !this.hasBaselineRecord(position), workspaceRoot: root, restore: false };
       }
-      return { baseline: snapshot.baseline, created: true, workspaceRoot: root };
+      return { baseline: snapshot.baseline, created: true, workspaceRoot: root, restore: false };
     } catch (error) {
       throw new VersioningError("storage_failed", String(error));
     }
+  }
+
+  private async inherit(position: SessionPosition, root: string) {
+    const receipt = this.transferPath(position.sessionFile, position.cwd);
+    const { source, intent, targetSessionFile } = JSON.parse(await this.readRegularFile(receipt)) as {
+      source: SessionPosition; intent: { sessionId: string; entryId: string; position: "before" | "at" }; targetSessionFile?: string;
+    };
+    // Consume before copying: a failed operation must not supply intent to a later
+    // ephemeral replacement, and an undeletable stale receipt is never trusted.
+    await rm(receipt);
+    if (!source || typeof source.sessionId !== "string" || typeof source.cwd !== "string" ||
+        !Array.isArray(source.entries) || source.sessionId === position.sessionId ||
+        targetSessionFile !== position.sessionFile || intent?.sessionId !== source.sessionId) {
+      throw new VersioningError("snapshot_unavailable", "Invalid source session identity.");
+    }
+    const sourceEntries = new Map(source.entries.map(entry => [entry.id, entry]));
+    const childEntries = new Map(position.entries.map(entry => [entry.id, entry]));
+    const selected = sourceEntries.get(intent.entryId);
+    if (!selected || !["before", "at"].includes(intent.position) ||
+        intent.position === "before" && (selected.type !== "message" || selected.message.role !== "user")) {
+      throw new VersioningError("snapshot_unavailable", "Invalid fork intent.");
+    }
+    const target = intent.position === "at" ? selected.id : selected.parentId;
+    const sourceBranch = this.branchAt(source, target);
+    const expected = sourceBranch.filter(id => sourceEntries.get(id)!.type !== "label");
+    const actual = this.branchAt(position, position.leafId).filter(id => childEntries.get(id)!.type !== "label");
+    const startupEntries = actual.slice(expected.length).map(id => childEntries.get(id)!);
+    if (JSON.stringify(expected) !== JSON.stringify(actual.slice(0, expected.length)) ||
+        startupEntries.some(entry => entry.type !== "model_change" && entry.type !== "thinking_level_change")) {
+      throw new VersioningError("snapshot_unavailable", "The copied native history does not match the fork destination.");
+    }
+    const baseline = await this.load(source);
+    if (baseline.workspaceRoot !== root) throw new VersioningError("workspace_mismatch", "Cannot inherit history across workspaces.");
+    const copiedNodes = new Set(position.entries.map(entry => entry.id));
+    const copiedNode = (nodeId: string) => {
+      if (copiedNodes.has(nodeId)) return nodeId;
+      const node = sourceEntries.get(nodeId);
+      if (node?.type !== "label" || !sourceBranch.includes(node.id)) return undefined;
+      // Pi removes labels from the copied chain and recreates them at its end.
+      // Prefer the first retained descendant (often our association entry), never
+      // move a saved state backwards to an earlier conversation message.
+      return sourceBranch.slice(sourceBranch.indexOf(node.id) + 1).find(id => copiedNodes.has(id)) ??
+        position.entries.find(entry => entry.type === "label" && entry.targetId === node.targetId && entry.label === node.label)?.id;
+    };
+    const anchorId = baseline.baseline.anchorId !== null && this.baselineCovers(baseline, sourceBranch)
+      ? copiedNode(baseline.baseline.anchorId) ?? baseline.baseline.anchorId : baseline.baseline.anchorId;
+    const checkpoints: CheckpointSnapshot[] = [];
+    for (const record of this.checkpointRecords(source, baseline)) {
+      const nodeId = copiedNode(record.nodeId);
+      if (nodeId) {
+        const snapshot = await this.loadCheckpoint(source, record, root);
+        checkpoints.push({ ...snapshot, checkpoint: { id: record.id, capturedAt: record.capturedAt, nodeId } });
+      }
+    }
+    const inheritedCheckpoints = checkpoints.map(snapshot => snapshot.checkpoint);
+    const destination = await this.storagePath(position.sessionId, true);
+    const staging = await mkdtemp(join(this.storageDir, ".inherit-"));
+    try {
+      for (const snapshot of checkpoints) {
+        await this.publishSnapshot(join(staging, "checkpoint-" + snapshot.checkpoint.id + ".json"),
+          { ...snapshot, sessionId: position.sessionId });
+      }
+      const inheritedBaseline: Snapshot = { ...baseline, sessionId: position.sessionId,
+        baseline: { ...baseline.baseline, anchorId }, inheritedCheckpoints };
+      await this.publishSnapshot(join(staging, "baseline.json"), inheritedBaseline);
+      // Publish the complete independent history at once, never a partial baseline.
+      await rename(staging, dirname(destination));
+    } catch (error) {
+      throw new VersioningError("storage_failed", String(error));
+    } finally { await rm(staging, { recursive: true, force: true }); }
+    return intent.position === "before";
   }
 
   private async load(position: SessionPosition): Promise<Snapshot> {
     let snapshot: Snapshot;
     try {
       const path = await this.storagePath(position.sessionId);
-      snapshot = parseSnapshot(await this.readSnapshot(path), "baseline");
+      snapshot = parseSnapshot(await this.readRegularFile(path), "baseline");
     } catch (error) {
+      const inherited = await lstat(this.path(position.sessionId, "") + ".origin.json").catch(error => {
+        if (error.code !== "ENOENT") throw error;
+        return undefined;
+      });
       throw new VersioningError(
-        (error as NodeJS.ErrnoException).code === "ENOENT" && !this.hasBaselineRecord(position) ? "no_baseline" : "snapshot_unavailable",
+        (error as NodeJS.ErrnoException).code === "ENOENT" && !this.hasBaselineRecord(position) && !inherited ? "no_baseline" : "snapshot_unavailable",
         "The session baseline is missing, unreadable, or corrupt.",
       );
     }
@@ -424,20 +562,36 @@ export class SessionFiles {
     return { checkpoint, comparison };
   }
 
-  private checkpointRecords(position: SessionPosition): Checkpoint[] {
-    return position.entries.filter(entry => entry.type === "custom" && entry.customType === "tree-versioning.checkpoint").map(entry => {
+  private checkpointRecords(position: SessionPosition, baseline: Snapshot): Checkpoint[] {
+    const inherited = new Map((baseline.inheritedCheckpoints ?? []).map(record => [record.id, record]));
+    const records = position.entries.filter(entry => entry.type === "custom" && entry.customType === "tree-versioning.checkpoint").map(entry => {
       const data = entry.type === "custom" ? entry.data : undefined;
-      if (!isCheckpoint(data) || entry.parentId === null || !this.branchAt(position, entry.parentId).includes(data.nodeId)) {
+      if (!isCheckpoint(data)) throw new VersioningError("snapshot_unavailable", "Invalid checkpoint association.");
+      // Keep copied semantic entries intact; the child manifest owns rebinding of
+      // native label IDs that the host removed and recreated during copying.
+      const record = inherited.get(data.id) ?? data;
+      if (record.capturedAt !== data.capturedAt || !(inherited.has(data.id) && record.nodeId === entry.id ||
+          entry.parentId !== null && this.branchAt(position, entry.parentId).includes(record.nodeId))) {
         throw new VersioningError("snapshot_unavailable", "Invalid checkpoint association.");
       }
-      return data;
+      return record;
     });
+    const merged = new Map(records.map(record => [record.id, record]));
+    for (const record of baseline.inheritedCheckpoints ?? []) {
+      const existing = merged.get(record.id);
+      if (!position.entries.some(entry => entry.id === record.nodeId) || existing &&
+          (existing.nodeId !== record.nodeId || existing.capturedAt !== record.capturedAt)) {
+        throw new VersioningError("snapshot_unavailable", "Invalid inherited checkpoint association.");
+      }
+      merged.set(record.id, record);
+    }
+    return [...merged.values()];
   }
 
   private async loadCheckpoint(position: SessionPosition, checkpoint: Checkpoint, root: string) {
     try {
       const path = await this.storagePath(position.sessionId, false, "checkpoint-" + checkpoint.id + ".json");
-      const snapshot = parseSnapshot(await this.readSnapshot(path), "checkpoint");
+      const snapshot = parseSnapshot(await this.readRegularFile(path), "checkpoint");
       if (snapshot.sessionId !== position.sessionId || snapshot.workspaceRoot !== root ||
           snapshot.checkpoint.id !== checkpoint.id || snapshot.checkpoint.nodeId !== checkpoint.nodeId ||
           snapshot.checkpoint.capturedAt !== checkpoint.capturedAt) {
@@ -476,7 +630,7 @@ export class SessionFiles {
 
   async checkpoints(position: SessionPosition) {
     const snapshot = await this.load(position);
-    const records = this.checkpointRecords(position);
+    const records = this.checkpointRecords(position, snapshot);
     const checkpoints: ReturnType<SessionFiles["checkpointEndpoint"]>[] = [];
     for (const record of records) {
       checkpoints.push(this.checkpointEndpoint(await this.loadCheckpoint(position, record, snapshot.workspaceRoot)));
@@ -508,7 +662,7 @@ export class SessionFiles {
     const baseline = await this.load(position);
     await this.assertExternalPersistence(position, baseline.workspaceRoot);
     const branch = this.branchAt(position, position.leafId);
-    const checkpoint = this.nearestCheckpoint(this.checkpointRecords(position), branch);
+    const checkpoint = this.nearestCheckpoint(this.checkpointRecords(position, baseline), branch);
     if (!checkpoint && !this.baselineCovers(baseline, branch)) {
       throw new VersioningError("no_baseline", "No saved file history covers the navigation destination.");
     }
@@ -556,7 +710,7 @@ export class SessionFiles {
       return relative;
     }));
     const snapshot = await this.load(position);
-    const records = this.checkpointRecords(position);
+    const records = this.checkpointRecords(position, snapshot);
     const currentBranch = this.branchAt(position, position.leafId);
     const checkpoint = recorded?.checkpoint ?? (checkpointId === undefined ? this.nearestCheckpoint(records, currentBranch) : records.find(record => record.id === checkpointId));
     if (scope === "turn" && !checkpoint) {

@@ -11,10 +11,11 @@ Development build for **@earendil-works/pi-coding-agent 1.5.2**. No public packa
 - Display persistent round-diff cards with file statistics and expandable text, without adding them to model context.
 - Open `/tree-versioning-diff` to inspect the current branch\'s saved session diff without changing files or history.
 - Restore managed files after successful native `/tree` navigation, using the actual destination's checkpoint, nearest preceding checkpoint, or applicable baseline.
+- Inherit the source baseline and the copied path's checkpoints on native `/fork` and `/clone` in the same workspace. A successful fork restores its actual destination; a clone keeps unsnapshotted disk edits.
 - Preserve file history across reloads, reopening, and session switching. Opening a session never restores or overwrites project files.
 - Select English or Simplified Chinese extension messages with `/tree-versioning-language en`, `zh-CN`, or `auto`.
 
-**Not implemented yet:** fork/clone inheritance and fork restoration. Do not use this development build as a backup. Forks/clones with copied baseline metadata currently report unavailable history rather than inventing inherited snapshots.
+Do not use this development build as a backup. Formal installation artifacts and release documentation are not complete.
 
 ## Local development
 
@@ -43,7 +44,7 @@ Paths and patches are not translated. Terminal control bytes are visibly escaped
 
 ## Native tree restoration
 
-**Successful `/tree` navigation directly replaces managed files. Unsnapshotted edits are overwritten, and new managed files absent from the target are deleted. There is no merge, extra backup, or confirmation added by this extension.** Startup notifications explain this policy in the selected language. Git HEAD, branch selection, and the index are not changed.
+**Successful `/tree` navigation and same-workspace `/fork` directly replace managed files. Unsnapshotted edits are overwritten, and new managed files absent from the target are deleted. There is no merge, extra backup, or confirmation added by this extension.** Startup notifications explain this policy in the selected language. Git HEAD, branch selection, and the index are not changed.
 
 The extension follows the native operation's **actual destination**, not just the selected row. Selecting a user message resumes at its parent; selecting an assistant or tool result continues at that entry; branch summaries follow their parent rather than the abandoned branch. A destination with a checkpoint restores itself. Otherwise, only its ancestors are searched, and the notification names the actual preceding checkpoint and native node. This is not exact per-message or per-tool restoration. When no checkpoint exists, only a baseline that covers the destination can be used.
 
@@ -54,6 +55,16 @@ Restoration validates snapshot integrity, identity, paths, current Git exclusion
 Missing, corrupt, or uncovered history leaves files alone, reports the problem, and never substitutes a different branch or older snapshot. Other restoration failures report that **files may be partially restored**. The native conversation destination is never undone or redirected, even on error. After fixing a failure, selecting the already-current node is still a no-op; navigate away and back to retry.
 
 Preparation is asynchronous and discarded if newer navigation, agent work, or runtime replacement supersedes it. Harmless session-name or label entries do not invalidate the destination. After preflight, file mutations are synchronous so host operations cannot interleave them; this can pause the UI for large restores. This is **not** a filesystem transaction or protection against external processes concurrently writing or replacing paths. A write failure can leave only some files restored; no global rollback is promised.
+
+## Fork and clone inheritance
+
+Use the native `/fork` and `/clone` commands in the same Git working tree. The child independently owns the source baseline and checkpoints whose native nodes occur in the copied path, not the source's other branches. A checkpoint is inherited even when its following association entry falls outside the copied path. Copied semantic display entries are preserved without injecting model messages. Query endpoints identify the child session and its native nodes; saved-session comparisons still start at the source baseline, not the disk state at fork time.
+
+After a successful `/fork`, files are restored using the actual native destination and the same safety checks and overwrite policy as `/tree`. A non-checkpoint destination uses its nearest preceding checkpoint or an applicable baseline. A late-activation baseline never pretends to cover earlier history. `/clone` only inherits history: it does not restore files, and retained hand edits remain visible in workspace comparisons. Cancelled or failed native forks do not restore files. Later checkpoints in the source are not changed or deleted.
+
+Inheritance survives runtime replacement and reloads, including native ephemeral (`--no-session`) sessions. Ephemeral conversations still cannot be reopened after process exit. When pi recreates label entries, inherited associations are rebound to retained native nodes without changing the copied semantic records. Once copying completes, deleting the source session and its snapshot directory does not affect the child's queries or restoration. Missing or corrupt source history and copy failures are reported without restoring files or substituting a fresh disk baseline. If native forking succeeds but restoration fails, the child and its native position remain; files may be partially restored. Reloading or reopening never retries restoration automatically.
+
+Cross-workspace inheritance, snapshot synchronization, and automatic cleanup are not supported. Snapshot inheritance can require substantial additional disk space.
 
 ## Query contract
 

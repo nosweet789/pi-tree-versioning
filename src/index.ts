@@ -33,7 +33,18 @@ export default async function treeVersioning(pi: ExtensionAPI) {
   let activeWorkspaceRoot: string | undefined;
   let restoreGeneration = 0;
   let active = true;
-  pi.on("session_shutdown", () => { active = false; restoreGeneration++; });
+  pi.on("session_before_fork", async (event, ctx) => {
+    try { await files.prepareFork(position(ctx), event.entryId, event.position); }
+    catch { reportError(ctx, language.message("inheritanceFailed")); }
+  });
+  pi.on("session_shutdown", async (event, ctx) => {
+    active = false;
+    restoreGeneration++;
+    if (event.reason === "fork") {
+      try { await files.finishFork(position(ctx), event.targetSessionFile); }
+      catch { reportError(ctx, language.message("inheritanceFailed")); }
+    }
+  });
   pi.on("before_agent_start", () => { restoreGeneration++; });
   const language = new Language(join(storage, "preferences.json"));
   let preferenceError: unknown;
@@ -82,7 +93,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
   registerLanguageCommand();
   pi.registerEntryRenderer<{ diff?: unknown }>("tree-versioning.checkpoint", (entry, options, theme) =>
     diffView(entry.data?.diff, language, options, theme));
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     if (ctx.mode === "tui") {
       ctx.ui.addAutocompleteProvider(current => {
         const descriptions = ([
@@ -109,8 +120,11 @@ export default async function treeVersioning(pi: ExtensionAPI) {
       });
     }
     if (preferenceError) notify(ctx, language.message("preferences_failed") + " " + String(preferenceError), "error");
+    let restoreFork = false;
     try {
-      const { baseline, created, workspaceRoot } = await files.initialize(position(ctx));
+      const initialized = await files.initialize(position(ctx), event.reason);
+      const { baseline, created, workspaceRoot } = initialized;
+      restoreFork = initialized.restore;
       activeWorkspaceRoot = workspaceRoot;
       if (created) {
         pi.appendEntry("tree-versioning.baseline", baseline);
@@ -119,8 +133,9 @@ export default async function treeVersioning(pi: ExtensionAPI) {
       notify(ctx, language.message("restorePolicy"), "info");
     } catch (error) {
       const reason = error instanceof VersioningError ? language.message(error.code) : String(error);
-      reportError(ctx, language.message("startupFailed", { reason }));
+      reportError(ctx, event.reason === "fork" ? language.message("inheritanceFailed") + " " + reason : language.message("startupFailed", { reason }));
     }
+    if (restoreFork) await restore(position(ctx), ctx);
     // Report optional preference failures only after independent file-history initialization.
     if (preferenceError && !ctx.hasUI) throw new Error(language.message("preferences_failed") + " " + String(preferenceError));
   });
@@ -144,21 +159,19 @@ export default async function treeVersioning(pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_tree", async (event, ctx) => {
-    if (event.newLeafId === event.oldLeafId) return;
+  const restore = async (destination: SessionPosition, ctx: ExtensionContext) => {
     const generation = ++restoreGeneration;
-    const destination = { ...position(ctx), leafId: event.newLeafId };
     try {
       const restored = await files.restore(destination, () => {
         if (!active || generation !== restoreGeneration || !ctx.isIdle()) return false;
         const branch = ctx.sessionManager.getBranch();
-        const index = event.newLeafId === null ? -1 : branch.findIndex(entry => entry.id === event.newLeafId);
-        return (event.newLeafId === null || index !== -1) &&
+        const index = destination.leafId === null ? -1 : branch.findIndex(entry => entry.id === destination.leafId);
+        return (destination.leafId === null || index !== -1) &&
           branch.slice(index + 1).every(entry => entry.type === "session_info" || entry.type === "label");
       });
       if (!active) return;
       const key = restored.kind === "baseline" ? "restoredBaseline" :
-        restored.nodeId === event.newLeafId ? "restoredCheckpoint" : "restoredPredecessor";
+        restored.nodeId === destination.leafId ? "restoredCheckpoint" : "restoredPredecessor";
       notify(ctx, language.message(key, { id: restored.id, nodeId: restored.kind === "checkpoint" ? restored.nodeId : restored.anchorId ?? "root" }), "info");
     } catch (error) {
       if (!active) return;
@@ -167,6 +180,9 @@ export default async function treeVersioning(pi: ExtensionAPI) {
         ? language.message("restoreUnavailable", { reason: language.message(code) })
         : language.message(code === "restore_superseded" ? code : "restore_failed"));
     }
+  };
+  pi.on("session_tree", async (event, ctx) => {
+    if (event.newLeafId !== event.oldLeafId) await restore({ ...position(ctx), leafId: event.newLeafId }, ctx);
   });
 
   const queryError = async (error: unknown) => {
