@@ -10,10 +10,11 @@ Development build for **@earendil-works/pi-coding-agent 1.5.2**. No public packa
 - Query round, saved-session, or unsnapshotted workspace differences with the read-only `session_diff` tool.
 - Display persistent round-diff cards with file statistics and expandable text, without adding them to model context.
 - Open `/tree-versioning-diff` to inspect the current branch\'s saved session diff without changing files or history.
+- Restore managed files after successful native `/tree` navigation, using the actual destination's checkpoint, nearest preceding checkpoint, or applicable baseline.
 - Preserve file history across reloads, reopening, and session switching. Opening a session never restores or overwrites project files.
 - Select English or Simplified Chinese extension messages with `/tree-versioning-language en`, `zh-CN`, or `auto`.
 
-**Not implemented yet:** file restoration and fork/clone inheritance. Do not use this development slice as a backup or assume that tree navigation restores files. Forks/clones with copied baseline metadata currently report unavailable history rather than inventing inherited snapshots.
+**Not implemented yet:** fork/clone inheritance and fork restoration. Do not use this development build as a backup. Forks/clones with copied baseline metadata currently report unavailable history rather than inventing inherited snapshots.
 
 ## Local development
 
@@ -39,6 +40,20 @@ The viewer needs interactive terminal mode; RPC, print, and JSON modes report th
 Historical cards replay the comparison saved at capture time; they do not revalidate snapshot availability or include subsequent disk changes. Their semantic data survives reloads and reopening and renders in the current language and theme. Older checkpoints recorded before card support have no saved display data; their cards report that limitation, while available snapshots remain queryable. Native branch and compaction visibility rules still apply.
 
 Paths and patches are not translated. Terminal control bytes are visibly escaped so file content cannot execute terminal instructions; ordinary line breaks and tabs in patches are laid out by the host. Text wraps by terminal columns, and expanded content remains reachable by scrolling. Complete comparisons are stored in the session, so large diffs increase session size. Review session exports before sharing: cards can contain source text even though they are excluded from model context.
+
+## Native tree restoration
+
+**Successful `/tree` navigation directly replaces managed files. Unsnapshotted edits are overwritten, and new managed files absent from the target are deleted. There is no merge, extra backup, or confirmation added by this extension.** Startup notifications explain this policy in the selected language. Git HEAD, branch selection, and the index are not changed.
+
+The extension follows the native operation's **actual destination**, not just the selected row. Selecting a user message resumes at its parent; selecting an assistant or tool result continues at that entry; branch summaries follow their parent rather than the abandoned branch. A destination with a checkpoint restores itself. Otherwise, only its ancestors are searched, and the notification names the actual preceding checkpoint and native node. This is not exact per-message or per-tool restoration. When no checkpoint exists, only a baseline that covers the destination can be used.
+
+Cancellation, summary cancellation/failure, and navigation with no actual movement do not restore files. Startup, reload, reopening, and session switching only read history. They never restore files by themselves. The query tools remain read-only; no agent restore tool is registered.
+
+Restoration validates snapshot integrity, identity, paths, current Git exclusions (including filesystem path aliases), and filesystem topology before applying changes. It does not follow directory links or overwrite now-excluded paths. A saved path that now conflicts with ignored content, a submodule, Git administrative data, or an unsafe parent causes an error rather than a forced overwrite. Leaf symbolic links are restored as links; replacing a regular file does not truncate an existing hard-link target.
+
+Missing, corrupt, or uncovered history leaves files alone, reports the problem, and never substitutes a different branch or older snapshot. Other restoration failures report that **files may be partially restored**. The native conversation destination is never undone or redirected, even on error. After fixing a failure, selecting the already-current node is still a no-op; navigate away and back to retry.
+
+Preparation is asynchronous and discarded if newer navigation, agent work, or runtime replacement supersedes it. Harmless session-name or label entries do not invalidate the destination. After preflight, file mutations are synchronous so host operations cannot interleave them; this can pause the UI for large restores. This is **not** a filesystem transaction or protection against external processes concurrently writing or replacing paths. A write failure can leave only some files restored; no global rollback is promised.
 
 ## Query contract
 
@@ -68,7 +83,7 @@ Model-facing output is bounded to approximately 50 KiB / 2000 lines plus a short
 
 The scope is the **whole Git working tree**, even when pi starts in a subdirectory: tracked files (including tracked ignored paths) and non-ignored untracked files. Deletions, binary bytes, executable flags, and symbolic links are preserved. Untracked ignored files, Git administrative data, submodule contents, and paths outside the working tree are excluded. Directory links are not traversed.
 
-Baselines and checkpoints are stored independently of project Git under `~/.pi/agent/tree-versioning/<session-id>/`, respecting `PI_CODING_AGENT_DIR`. Snapshot checksums and session/workspace identities are validated before comparison. Failed collection does not publish a partial baseline or checkpoint. Failures use localized UI notifications, or the host extension-error channel in print/JSON modes, without adding a model message. A successfully captured unchanged round has a checkpoint and an empty round diff, unlike a failed capture. A first activation in an old session covers only the activation position and new descendants, not earlier history or descendants that already existed before activation.
+Baselines and checkpoints are stored independently of project Git under `~/.pi/agent/tree-versioning/<session-id>/`, respecting `PI_CODING_AGENT_DIR`. Snapshot checksums and session/workspace identities are validated before comparison or restoration. Failed collection does not publish a partial baseline or checkpoint. Failures use localized UI notifications, or the host extension-error channel in print/JSON modes, without adding a model message. A successfully captured unchanged round has a checkpoint and an empty round diff, unlike a failed capture. A first activation in an old session covers only the activation position and new descendants, not earlier history or descendants that already existed before activation.
 
 Collection reads files as they are encountered; it is not an atomic filesystem snapshot during concurrent writes. Snapshots are currently kept in full, with no automatic cleanup or remote synchronization. Large repositories can require substantial memory and disk space. Both the pi data directory and the current session file must be outside the managed workspace. Baseline and checkpoint creation reject contained persistence before writing snapshots or session metadata, avoiding self-referential changes.
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -29,10 +29,11 @@ test("native navigation and branch summaries resolve only the landed node's ance
     assert.equal(saved.to.id, common.id);
     assert.deepEqual(saved.files.map((file: any) => file.path), ["notes.txt"]);
     assert.match(saved.files[0].patch, /\+common round/);
-    assert.equal(await readFile(join(testWorkspace.cwd, "notes.txt"), "utf8"), "abandoned round\n");
-    assert.deepEqual(((await app.diff()).details as any).files.map((file: any) => file.path), ["abandoned.txt", "notes.txt"]);
-
-    await rm(join(testWorkspace.cwd, "abandoned.txt"));
+    assert.equal(await readFile(join(testWorkspace.cwd, "notes.txt"), "utf8"), "common round\n");
+    assert.deepEqual(((await app.diff()).details as any).files, []);
+    assert.ok(app.notices.at(-1)!.message.includes(common.id));
+    assert.match(app.notices.at(-1)!.message, /nearest preceding checkpoint/);
+    await assert.rejects(readFile(join(testWorkspace.cwd, "abandoned.txt")), { code: "ENOENT" });
     await writeFile(join(testWorkspace.cwd, "notes.txt"), "alternate round\n");
     await app.session.prompt("Alternate round.");
     const catalog = (await app.checkpoints()).details as any;
@@ -53,6 +54,11 @@ test("native navigation and branch summaries resolve only the landed node's ance
     assert.equal(current.snapshot.id, common.id);
     assert.equal((await app.diff({ scope: "session" })).isError, false);
     assert.equal(app.manager.getLeafId(), current.nodeId);
+    assert.equal(await readFile(join(testWorkspace.cwd, "notes.txt"), "utf8"), "common round\n");
+    await app.session.navigateTree(abandoned.nodeId, { summarize: false });
+    assert.equal(await readFile(join(testWorkspace.cwd, "notes.txt"), "utf8"), "abandoned round\n");
+    assert.equal(await readFile(join(testWorkspace.cwd, "abandoned.txt"), "utf8"), "only this branch\n");
+    assert.equal(((await app.checkpoints()).details as any).current.snapshot.id, abandoned.id);
   } finally { dispose(app.session); }
 });
 

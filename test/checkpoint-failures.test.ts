@@ -107,6 +107,11 @@ for (const damage of ["missing", "corrupt", "fifo"] as const) {
       assert.equal((await app.checkpoints()).isError, true);
       assert.deepEqual(app.manager.getEntries(), entries);
       assert.equal(await readFile(join(testWorkspace.cwd, "notes.txt"), "utf8"), "manual edit remains\n");
+      await app.session.navigateTree(checkpoints[0].nodeId, { summarize: false });
+      assert.equal(app.manager.getLeafId(), checkpoints[0].nodeId);
+      assert.equal(await readFile(join(testWorkspace.cwd, "notes.txt"), "utf8"), "manual edit remains\n");
+      assert.equal(app.notices.at(-1)!.type, "error");
+      assert.match(app.notices.at(-1)!.message, /no files were restored/);
     } finally { dispose(app.session); }
   });
 }

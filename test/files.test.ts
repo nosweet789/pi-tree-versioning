@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readlink, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { dispose, fixture, git, load } from "./harness.ts";
@@ -11,6 +11,9 @@ test("symbolic-link targets with non-UTF-8 bytes compare losslessly across reloa
   await symlink(Buffer.from([0x80]), path);
   const app = await load(testWorkspace);
   try {
+    const baselineNode = app.manager.getLeafId()!;
+    await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
+    await app.session.prompt("Record raw link bytes.");
     assert.deepEqual(((await app.diff()).details as any).files, []);
     await unlink(path);
     await symlink(Buffer.from([0x81]), path);
@@ -22,6 +25,8 @@ test("symbolic-link targets with non-UTF-8 bytes compare losslessly across reloa
     assert.equal(changes[0].binary, true);
     assert.deepEqual(changes[0].before, { kind: "symlink", target: "gA==", targetEncoding: "base64" });
     assert.deepEqual(changes[0].after, { kind: "symlink", target: "gQ==", targetEncoding: "base64" });
+    await app.session.navigateTree(baselineNode, { summarize: false });
+    assert.deepEqual(await readlink(path, { encoding: "buffer" }), Buffer.from([0x80]));
   } finally { dispose(app.session); }
 });
 
@@ -57,12 +62,14 @@ test("managed files include tracked ignored paths and preserve binary and link s
   await writeFile(join(testWorkspace.cwd, "vendor", "private.txt"), "submodule before\n");
   const app = await load(testWorkspace);
   try {
+    const baselineNode = app.manager.getLeafId()!;
     await writeFile(join(testWorkspace.root, "outside.txt"), "outside after\n");
     await writeFile(join(testWorkspace.cwd, "secret.ignored"), "still not managed\n");
     await writeFile(join(testWorkspace.cwd, "vendor", "private.txt"), "submodule after\n");
     await writeFile(join(testWorkspace.cwd, ".git", "excluded"), "internal data\n");
     assert.deepEqual(((await app.diff()).details as any).files, []);
     await writeFile(join(testWorkspace.cwd, "tracked.ignored"), "after\n");
+    await chmod(join(testWorkspace.cwd, "tracked.ignored"), 0o755);
     await writeFile(join(testWorkspace.cwd, "image.bin"), Buffer.from([0, 255, 2, 3]));
     await unlink(join(testWorkspace.cwd, "link"));
     await symlink("missing-target", join(testWorkspace.cwd, "link"));
@@ -90,6 +97,25 @@ test("managed files include tracked ignored paths and preserve binary and link s
     await app.session.reload();
     assert.deepEqual(((await app.diff({ scope: "session" })).details as any).files, files);
     assert.deepEqual(((await app.diff()).details as any).files, []);
+    const checkpoint = ((await app.checkpoints()).details as any).checkpoints[0];
+    const indexBytes = await readFile(join(testWorkspace.cwd, ".git", "index"));
+    const branch = git(testWorkspace.cwd, "symbolic-ref", "HEAD");
+    await app.session.navigateTree(baselineNode, { summarize: false });
+    assert.equal(await readFile(join(testWorkspace.cwd, "notes.txt"), "utf8"), "committed\n");
+    assert.equal(await readFile(join(testWorkspace.cwd, "tracked.ignored"), "utf8"), "before\n");
+    assert.equal((await lstat(join(testWorkspace.cwd, "tracked.ignored"))).mode & 0o111, 0);
+    assert.deepEqual(await readFile(join(testWorkspace.cwd, "image.bin")), Buffer.from([0, 255, 1]));
+    assert.equal(await readlink(join(testWorkspace.cwd, "link")), join(testWorkspace.root, "outside.txt"));
+    await assert.rejects(readFile(join(testWorkspace.cwd, "新增\tfile.txt")), { code: "ENOENT" });
+    await app.session.navigateTree(checkpoint.nodeId, { summarize: false });
+    assert.deepEqual(((await app.diff()).details as any).files, []);
+    assert.equal((await lstat(join(testWorkspace.cwd, "tracked.ignored"))).mode & 0o111, 0o111);
+    assert.equal(await readFile(join(testWorkspace.cwd, "secret.ignored"), "utf8"), "still not managed\n");
+    assert.equal(await readFile(join(testWorkspace.cwd, "vendor", "private.txt"), "utf8"), "submodule after\n");
+    assert.equal(await readFile(join(testWorkspace.cwd, ".git", "excluded"), "utf8"), "internal data\n");
+    assert.equal(await readFile(join(testWorkspace.root, "outside.txt"), "utf8"), "outside after\n");
+    assert.deepEqual(await readFile(join(testWorkspace.cwd, ".git", "index")), indexBytes);
+    assert.equal(git(testWorkspace.cwd, "symbolic-ref", "HEAD"), branch);
     assert.equal(git(testWorkspace.cwd, "rev-parse", "HEAD"), head);
     assert.equal(git(testWorkspace.cwd, "ls-files", "--stage"), index);
   } finally { dispose(app.session); }

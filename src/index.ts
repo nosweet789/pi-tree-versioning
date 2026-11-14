@@ -31,6 +31,10 @@ export default async function treeVersioning(pi: ExtensionAPI) {
   const storage = join(getAgentDir(), "tree-versioning");
   const files = new SessionFiles(storage);
   let activeWorkspaceRoot: string | undefined;
+  let restoreGeneration = 0;
+  let active = true;
+  pi.on("session_shutdown", () => { active = false; restoreGeneration++; });
+  pi.on("before_agent_start", () => { restoreGeneration++; });
   const language = new Language(join(storage, "preferences.json"));
   let preferenceError: unknown;
   try { await language.load(); } catch (error) { preferenceError = error; }
@@ -112,6 +116,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
         pi.appendEntry("tree-versioning.baseline", baseline);
         notify(ctx, language.message("baselineCreated"), "info");
       }
+      notify(ctx, language.message("restorePolicy"), "info");
     } catch (error) {
       const reason = error instanceof VersioningError ? language.message(error.code) : String(error);
       reportError(ctx, language.message("startupFailed", { reason }));
@@ -136,6 +141,31 @@ export default async function treeVersioning(pi: ExtensionAPI) {
     }
     if (recorded.comparison.status === "error") {
       reportError(ctx, language.message("diffFailed", { reason: language.message(recorded.comparison.code) }));
+    }
+  });
+
+  pi.on("session_tree", async (event, ctx) => {
+    if (event.newLeafId === event.oldLeafId) return;
+    const generation = ++restoreGeneration;
+    const destination = { ...position(ctx), leafId: event.newLeafId };
+    try {
+      const restored = await files.restore(destination, () => {
+        if (!active || generation !== restoreGeneration || !ctx.isIdle()) return false;
+        const branch = ctx.sessionManager.getBranch();
+        const index = event.newLeafId === null ? -1 : branch.findIndex(entry => entry.id === event.newLeafId);
+        return (event.newLeafId === null || index !== -1) &&
+          branch.slice(index + 1).every(entry => entry.type === "session_info" || entry.type === "label");
+      });
+      if (!active) return;
+      const key = restored.kind === "baseline" ? "restoredBaseline" :
+        restored.nodeId === event.newLeafId ? "restoredCheckpoint" : "restoredPredecessor";
+      notify(ctx, language.message(key, { id: restored.id, nodeId: restored.kind === "checkpoint" ? restored.nodeId : restored.anchorId ?? "root" }), "info");
+    } catch (error) {
+      if (!active) return;
+      const code = error instanceof VersioningError ? error.code : "restore_failed";
+      reportError(ctx, code === "no_baseline" || code === "snapshot_unavailable" || code === "workspace_mismatch"
+        ? language.message("restoreUnavailable", { reason: language.message(code) })
+        : language.message(code === "restore_superseded" ? code : "restore_failed"));
     }
   });
 

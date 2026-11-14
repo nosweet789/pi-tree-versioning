@@ -1,10 +1,10 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { isUtf8 } from "node:buffer";
 import { execFile } from "node:child_process";
-import { constants } from "node:fs";
+import { constants, lstatSync, mkdirSync, readdirSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { link, lstat, mkdir, open, readlink, realpath, rm, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { promisify } from "node:util";
 import { formatPatch, structuredPatch } from "diff";
 import { VersioningError, type ErrorCode } from "./errors.ts";
@@ -88,19 +88,35 @@ function parseSnapshot(text: string, kind: "baseline" | "checkpoint"): Snapshot 
            state.targetEncoding === "base64" && Buffer.from(state.target, "base64").toString("base64") === state.target))) {
       throw new Error("Invalid snapshot file state");
     }
+    if (state.kind === "symlink" && (!bytes(state).length || bytes(state).includes(0))) {
+      throw new Error("Invalid symbolic-link target");
+    }
+    const segments = path.split("/");
+    for (let length = 1; length < segments.length; length++) {
+      if (Object.hasOwn(value.files, segments.slice(0, length).join("/"))) throw new Error("Conflicting snapshot paths");
+    }
   }
   value.files = Object.assign(Object.create(null), value.files);
   return value as Snapshot | CheckpointSnapshot;
 }
 
-async function git(cwd: string, args: string[]): Promise<string> {
+async function git(cwd: string, args: string[], input?: string): Promise<string> {
   const environment = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
   for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"]) {
     delete (environment as NodeJS.ProcessEnv)[key];
   }
-  const { stdout } = await exec("git", ["-C", cwd, ...args], {
+  const command = exec("git", ["-C", cwd, ...args], {
     env: environment, encoding: "buffer", maxBuffer: 64 * 1024 * 1024, timeout: 30_000,
   });
+  const inputComplete = input === undefined ? Promise.resolve() : new Promise<void>((resolve, reject) => {
+    const stream = command.child.stdin!;
+    stream.on("error", reject);
+    stream.end(input, (error?: Error | null) => error ? reject(error) : resolve());
+  });
+  const [{ stdout }] = await Promise.all([command.catch(error => {
+    if (args[0] === "check-ignore" && error.code === 1) return { stdout: Buffer.alloc(0) };
+    throw error;
+  }), inputComplete]);
   if (!isUtf8(stdout)) throw new Error("Git returned paths that are not valid UTF-8");
   return stdout.toString("utf8");
 }
@@ -117,7 +133,18 @@ async function capture(root: string): Promise<Record<string, FileState>> {
   }
 }
 
-async function collect(root: string): Promise<Record<string, FileState>> {
+async function entryLocation(path: string) {
+  const stat = await lstat(path).catch(error => {
+    if (!["ENOENT", "ENOTDIR"].includes(error.code)) throw error;
+    return undefined;
+  });
+  // Resolve filesystem spelling without following a leaf symbolic link.
+  const location = stat && !stat.isSymbolicLink() ? await realpath(path) :
+    join(await canonicalLocation(dirname(path)), basename(path));
+  return { location, stat };
+}
+
+async function workspaceScope(root: string) {
   const tracked = await git(root, ["ls-files", "--stage", "-z"]);
   const untracked = await git(root, ["ls-files", "--others", "--exclude-standard", "-z"]);
   const administrativePaths = await Promise.all(["--absolute-git-dir", "--git-common-dir"].map(async flag => {
@@ -126,18 +153,40 @@ async function collect(root: string): Promise<Record<string, FileState>> {
   }));
   const excluded = administrativePaths.filter(path => path !== ".." && !path.startsWith("../") && !isAbsolute(path));
   const submodules: string[] = [];
+  const trackedPaths = new Set<string>();
   const paths = new Set(untracked.split("\0").filter(Boolean));
   for (const record of tracked.split("\0").filter(Boolean)) {
     const separator = record.indexOf("\t");
     const path = record.slice(separator + 1);
     if (record.startsWith("160000 ")) submodules.push(path);
-    else paths.add(path);
+    else { paths.add(path); trackedPaths.add(path); }
   }
+  const exclusions = await Promise.all([...submodules, ...excluded].map(path => entryLocation(join(root, path))));
+  const marker = await lstat(join(root, ".git"));
+  const alternate = await lstat(join(root, ".GIT")).catch(error => {
+    if (error.code !== "ENOENT") throw error;
+    return undefined;
+  });
+  const caseInsensitive = alternate?.dev === marker.dev && alternate.ino === marker.ino;
+  const spelling = (path: string) => caseInsensitive ? path.normalize("NFD").toLowerCase() : path;
+  return {
+    paths, trackedPaths,
+    async excludes(path: string, replacingDirectory = false) {
+      const entry = await entryLocation(join(root, path));
+      return !isWithin(spelling(root), spelling(entry.location)) || exclusions.some(exclusion =>
+        isWithin(spelling(exclusion.location), spelling(entry.location)) ||
+        replacingDirectory && isWithin(spelling(entry.location), spelling(exclusion.location)) ||
+        entry.stat && exclusion.stat && entry.stat.dev === exclusion.stat.dev && entry.stat.ino === exclusion.stat.ino);
+    },
+  };
+}
+
+async function collect(root: string, scope?: Awaited<ReturnType<typeof workspaceScope>>): Promise<Record<string, FileState>> {
+  scope ??= await workspaceScope(root);
   const files: Record<string, FileState> = Object.create(null);
-  for (const path of paths) {
+  for (const path of scope.paths) {
     const segments = path.split("/");
     if (!validPath(path)) continue;
-    if ([...submodules, ...excluded].some(exclusion => path === exclusion || path.startsWith(exclusion + "/"))) continue;
     try {
       let parent = root;
       let blocked = false;
@@ -146,7 +195,7 @@ async function collect(root: string): Promise<Record<string, FileState>> {
         const stat = await lstat(parent);
         if (!stat.isDirectory()) { blocked = true; break; }
       }
-      if (blocked) continue;
+      if (blocked || await scope.excludes(path)) continue;
       const absolutePath = join(root, path);
       const stat = await lstat(absolutePath);
       if (stat.isSymbolicLink()) {
@@ -191,7 +240,67 @@ function compare(path: string, before: FileState | undefined, after: FileState |
   };
 }
 
-/** Owns file collection, persistence, history coverage, and comparisons. */
+function applySnapshot(root: string, current: Record<string, FileState>, target: Record<string, FileState>) {
+  if (!lstatSync(root).isDirectory() || realpathSync(root) !== root) throw new Error("Workspace root changed before restoration.");
+  const statAt = (path: string) => {
+    try { return lstatSync(join(root, path)); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  };
+  const directories = new Set<string>();
+  const inspectDirectory = (path: string) => {
+    for (const name of readdirSync(join(root, path))) {
+      const child = path + "/" + name;
+      if (!validPath(child)) throw new Error(`Restore would remove protected content: ${child}`);
+      const stat = statAt(child)!;
+      if (stat.isDirectory()) inspectDirectory(child);
+      else if (!(child in current) || child in target) throw new Error(`Restore would remove unmanaged content: ${child}`);
+    }
+    directories.add(path);
+  };
+  // Preflight topology before deleting anything, including ignored directory contents.
+  for (const path of Object.keys(target)) {
+    let parent = "";
+    let parentNeedsCreation = false;
+    for (const segment of path.split("/").slice(0, -1)) {
+      parent = parent ? parent + "/" + segment : segment;
+      if (parent in target) throw new Error(`Conflicting snapshot paths: ${path}`);
+      if (parentNeedsCreation) continue;
+      const stat = statAt(parent);
+      if (!stat) { parentNeedsCreation = true; continue; }
+      if (stat.isDirectory()) continue;
+      if (stat.isFile() && parent in current) { parentNeedsCreation = true; continue; }
+      throw new Error(`Unsafe restore parent: ${path}`);
+    }
+    if (parentNeedsCreation) continue;
+    const stat = statAt(path);
+    if (stat?.isDirectory()) inspectDirectory(path);
+    else if (stat && !stat.isFile() && !stat.isSymbolicLink()) throw new Error(`Unsupported restore target: ${path}`);
+  }
+  // The mutation window is synchronous: host navigation or runtime replacement cannot
+  // interleave these writes. External concurrent filesystem writers are not supported.
+  for (const path of Object.keys(current).sort((a, b) => b.split("/").length - a.split("/").length)) {
+    if (!(path in target)) unlinkSync(join(root, path));
+  }
+  for (const directory of directories) rmdirSync(join(root, directory));
+  for (const [path, state] of Object.entries(target)) {
+    if (JSON.stringify(current[path]) === JSON.stringify(state)) continue;
+    let parent = root;
+    for (const segment of path.split("/").slice(0, -1)) {
+      parent = join(parent, segment);
+      try { mkdirSync(parent); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      if (!lstatSync(parent).isDirectory()) throw new Error(`Unsafe restore parent: ${path}`);
+    }
+    const absolute = join(root, path);
+    // Never truncate an existing inode: it may be a hard link outside the workspace.
+    try { unlinkSync(absolute); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (state.kind === "symlink") symlinkSync(bytes(state), absolute);
+    else writeFileSync(absolute, bytes(state), { flag: "wx", mode: state.executable ? 0o755 : 0o644 });
+  }
+}
+
+/** Owns file collection, persistence, history coverage, comparisons, and restoration. */
 export class SessionFiles {
   constructor(private readonly storageDir: string) {}
 
@@ -393,6 +502,38 @@ export class SessionFiles {
       current = parents.get(current)!;
     }
     return branch.reverse();
+  }
+
+  async restore(position: SessionPosition, stillCurrent: () => boolean) {
+    const baseline = await this.load(position);
+    await this.assertExternalPersistence(position, baseline.workspaceRoot);
+    const branch = this.branchAt(position, position.leafId);
+    const checkpoint = this.nearestCheckpoint(this.checkpointRecords(position), branch);
+    if (!checkpoint && !this.baselineCovers(baseline, branch)) {
+      throw new VersioningError("no_baseline", "No saved file history covers the navigation destination.");
+    }
+    const snapshot = checkpoint ? await this.loadCheckpoint(position, checkpoint, baseline.workspaceRoot) : baseline;
+    const root = snapshot.workspaceRoot;
+    try {
+      const scope = await workspaceScope(root);
+      const targetPaths = Object.keys(snapshot.files);
+      for (const path of targetPaths) {
+        if (await scope.excludes(path, true)) {
+          throw new Error(`Restore would replace excluded content: ${path}`);
+        }
+      }
+      const untrackedTargets = targetPaths.filter(path => !scope.trackedPaths.has(path));
+      if (untrackedTargets.length && await git(root, ["check-ignore", "--no-index", "-z", "--stdin"], untrackedTargets.join("\0") + "\0")) {
+        throw new Error("Restore would replace an untracked ignored path.");
+      }
+      const current = await collect(root, scope);
+      if (!stillCurrent()) throw new VersioningError("restore_superseded", "The restore destination is no longer current.");
+      applySnapshot(root, current, snapshot.files);
+    } catch (error) {
+      if (error instanceof VersioningError) throw error;
+      throw new VersioningError("restore_failed", String(error));
+    }
+    return checkpoint ? this.checkpointEndpoint(snapshot as CheckpointSnapshot) : this.baselineEndpoint(baseline);
   }
 
   async diff(position: SessionPosition, request: ComparisonRequest = {}) {

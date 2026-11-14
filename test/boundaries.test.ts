@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { dispose, fixture, git, load } from "./harness.ts";
+import { responseStream, useModel } from "./agent-fixture.ts";
 
 test("an existing in-workspace session cannot acquire self-referential baseline metadata", async () => {
   const testWorkspace = await fixture();
@@ -73,6 +74,13 @@ test("Git administrative files are excluded even when the Git directory has a no
   try {
     await writeFile(join(administrative, "private-internal-data"), "not workspace content\n");
     assert.deepEqual(((await app.diff()).details as any).files, []);
+    await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
+    await app.session.prompt("Record before restoring.");
+    const target = ((await app.checkpoints()).details as any).checkpoints[0];
+    await writeFile(join(testWorkspace.cwd, "notes.txt"), "manual edit\n");
+    await app.session.navigateTree(target.nodeId, { summarize: false });
+    assert.equal(await readFile(join(testWorkspace.cwd, "notes.txt"), "utf8"), "committed\n");
+    assert.equal(await readFile(join(administrative, "private-internal-data"), "utf8"), "not workspace content\n");
   } finally { dispose(app.session); }
 });
 
@@ -90,6 +98,12 @@ test("reopening a session in a different workspace cannot use its saved baseline
     assert.equal((result.details as any).code, "workspace_mismatch");
     assert.equal(reopened.notices.at(-1)?.type, "error");
     assert.equal(await readFile(join(other.cwd, "notes.txt"), "utf8"), "committed\n");
+    const baselineNode = reopened.manager.getEntries().find(entry => entry.type === "custom" && entry.customType === "tree-versioning.baseline")!;
+    await writeFile(join(other.cwd, "notes.txt"), "other workspace edit\n");
+    await reopened.session.navigateTree(baselineNode.id, { summarize: false });
+    assert.equal(reopened.manager.getLeafId(), baselineNode.id);
+    assert.equal(await readFile(join(other.cwd, "notes.txt"), "utf8"), "other workspace edit\n");
+    assert.match(reopened.notices.at(-1)!.message, /different session or workspace/);
   } finally { dispose(reopened.session); }
 });
 
