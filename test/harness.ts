@@ -47,11 +47,16 @@ export async function load(testWorkspace: Fixture, manager = SessionManager.crea
   });
   const resourceLoader = new DefaultResourceLoader({
     cwd: testWorkspace.cwd, agentDir: testWorkspace.agentDir, settingsManager,
-    additionalExtensionPaths: [resolve("src/index.ts")], extensionFactories,
+    additionalExtensionPaths: [process.env.TREE_VERSIONING_TEST_PACKAGE ?? resolve("src/index.ts")], extensionFactories,
     noExtensions: true, noSkills: true, noThemes: true, noPromptTemplates: true, noContextFiles: true,
   });
   await resourceLoader.reload();
   assert.deepEqual(resourceLoader.getExtensions().errors, []);
+  if (process.env.TREE_VERSIONING_TEST_PACKAGE) {
+    assert.ok(resourceLoader.getExtensions().extensions.some(extension =>
+      extension.path === join(process.env.TREE_VERSIONING_TEST_PACKAGE!, "src/index.ts")),
+    "Regression tests must load the installed artifact, not source");
+  }
   const modelRuntime = await ModelRuntime.create({
     authPath: join(testWorkspace.agentDir, "auth.json"), modelsPath: join(testWorkspace.agentDir, "models.json"),
     modelsStorePath: join(testWorkspace.agentDir, "model-cache.json"), refreshOnCreate: false,

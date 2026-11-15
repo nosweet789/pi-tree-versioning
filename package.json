@@ -1,13 +1,19 @@
 {
-  "name": "pi-tree-versioning-local",
+  "name": "pi-tree-versioning",
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Workspace file history for pi sessions (development build).",
+  "description": "Workspace file checkpoints and diffs for pi sessions.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nosweet789/pi-tree-versioning.git"
+  },
   "files": [
     "src",
-    "README.md"
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
   ],
   "pi": {
     "extensions": [
@@ -15,6 +21,8 @@
     ]
   },
   "scripts": {
+    "build": "npm run typecheck",
+    "test:package": "node --import ./test/isolate.mjs --import tsx --test --test-concurrency=1 test/package.integration.ts",
     "test": "node --import ./test/isolate.mjs --import tsx --test --test-concurrency=1 test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
