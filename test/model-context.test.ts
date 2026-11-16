@@ -33,10 +33,11 @@ test("automatic cards remain outside actual model requests across language chang
   } finally { dispose(app.session); }
 });
 
-test("both read-only tools reach model context while automatic file history records do not", async () => {
+test("all read-only tools reach model context while automatic file history records do not", async () => {
   const testWorkspace = await fixture();
   const app = await load(testWorkspace);
   try {
+    await app.session.prompt("/tree-versioning-restore off");
     await writeFile(join(testWorkspace.cwd, "notes.txt"), "model-visible change\n");
     const requests: unknown[] = [];
     await useModel(app, async (_model, context) => {
@@ -46,6 +47,7 @@ test("both read-only tools reach model context while automatic file history reco
         ? { stopReason: "toolUse", content: [
           { type: "toolCall", id: "diff-call", name: "session_diff", arguments: { scope: "workspace" } },
           { type: "toolCall", id: "checkpoints-call", name: "session_checkpoints", arguments: {} },
+          { type: "toolCall", id: "status-call", name: "tree_versioning_status", arguments: {} },
         ] }
         : { content: [{ type: "text", text: "Done." }] });
     });
@@ -53,14 +55,18 @@ test("both read-only tools reach model context while automatic file history reco
     assert.equal(requests.length, 2);
     assert.match(JSON.stringify(requests[1]), /model-visible change/);
     const toolResults = app.session.messages.filter(message => message.role === "toolResult");
-    assert.equal(toolResults.length, 2);
+    assert.equal(toolResults.length, 3);
     assert.ok(toolResults.every(result => !result.isError));
+    const status = toolResults.find(result => result.toolName === "tree_versioning_status")!;
+    assert.deepEqual(status.details, { restoreEnabled: false });
+    assert.match(JSON.stringify(requests[1]), /restoreEnabled/);
+    assert.deepEqual(status.content, [{ type: "text", text: '{"restoreEnabled":false}' }]);
     assert.deepEqual((toolResults.find(result => result.toolName === "session_checkpoints")!.details as { checkpoints: unknown[] }).checkpoints, []);
     assert.equal(((await app.checkpoints()).details as any).checkpoints.length, 1);
     await app.session.prompt("Continue without querying.");
     assert.equal(requests.length, 3);
     assert.doesNotMatch(JSON.stringify(requests), /tree-versioning\.(baseline|checkpoint|diff)/);
     assert.equal(((await app.checkpoints()).details as any).checkpoints.length, 2);
-    assert.deepEqual(app.session.getActiveToolNames().sort(), ["read", "bash", "edit", "write", "session_diff", "session_checkpoints"].sort());
+    assert.deepEqual(app.session.getActiveToolNames().sort(), ["read", "bash", "edit", "write", "session_diff", "session_checkpoints", "tree_versioning_status"].sort());
   } finally { dispose(app.session); }
 });

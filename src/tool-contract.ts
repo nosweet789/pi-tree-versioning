@@ -1,6 +1,10 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
 
+export const statusParameters = Type.Object({}, { additionalProperties: false });
+export type StatusInput = Static<typeof statusParameters>;
+export const statusOutput = Type.Object({ restoreEnabled: Type.Boolean() });
+
 export const diffParameters = Type.Object({
   scope: Type.Optional(Type.Unsafe<"workspace" | "turn" | "session">(StringEnum(["workspace", "turn", "session"], { description: "workspace (default): saved state to disk; turn: previous checkpoint to selected round; session: baseline to current saved state." }))),
   checkpointId: Type.Optional(Type.String({ description: "For turn scope only. Defaults to the nearest checkpoint on the current ancestry." })),

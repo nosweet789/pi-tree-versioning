@@ -12,6 +12,7 @@ test("the existing terminal completion provider updates command help immediately
   const cached = new CombinedAutocompleteProvider([
     { name: "tree-versioning-language", description: "[extension] Choose the tree-versioning language" },
     { name: "tree-versioning-diff", description: "[extension] View the current branch's saved session diff" },
+    { name: "tree-versioning-restore", description: "[extension] Control automatic file restoration" },
   ], testWorkspace.cwd);
   const app = await load(testWorkspace, undefined, { autocomplete: cached });
   try {
@@ -20,15 +21,20 @@ test("the existing terminal completion provider updates command help immediately
     const suggestions = () => existing.getSuggestions([input], 0, input.length, { signal: new AbortController().signal });
     const diffInput = "/tree-versioning-d";
     const diffSuggestions = () => existing.getSuggestions([diffInput], 0, diffInput.length, { signal: new AbortController().signal });
+    const restoreInput = "/tree-versioning-r";
+    const restoreSuggestions = () => existing.getSuggestions([restoreInput], 0, restoreInput.length, { signal: new AbortController().signal });
     assert.match((await suggestions())!.items[0].description!, /Choose/);
     await app.command("zh-CN");
     assert.equal(app.autocomplete, existing);
     assert.match((await suggestions())!.items[0].description!, /^\[extension\] .*语言/);
     assert.equal((await suggestions())!.items[0].value, "tree-versioning-language");
     assert.match((await diffSuggestions())!.items[0].description!, /会话总差异/);
+    assert.match((await restoreSuggestions())!.items[0].description!, /自动恢复文件/);
+    assert.match(app.session.extensionRunner.getCommand("tree-versioning-restore")!.description!, /自动恢复文件/);
     await app.command("en");
     assert.match((await suggestions())!.items[0].description!, /Choose/);
     assert.match((await diffSuggestions())!.items[0].description!, /saved session diff/);
+    assert.match((await restoreSuggestions())!.items[0].description!, /automatic file restoration/);
   } finally { dispose(app.session); }
 });
 
@@ -40,7 +46,7 @@ for (const mode of ["print", "json"] as const) {
     await writeFile(join(storage, "preferences.json"), "{invalid");
     const app = await load(testWorkspace, undefined, { mode, expectedStartupErrors: 1 });
     try {
-      assert.match(app.errors[0], /language preference/);
+      assert.match(app.errors[0], /extension preferences/);
       const catalog = await app.checkpoints();
       assert.equal(catalog.isError, false, JSON.stringify(catalog));
       assert.equal((catalog.details as any).baseline.kind, "baseline");

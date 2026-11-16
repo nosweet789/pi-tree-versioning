@@ -4,7 +4,7 @@
 
 Keep file history alongside pi's native session tree: save checkpoints after each processing round, inspect changes, and restore saved files when navigating or forking. The interface supports English and Simplified Chinese.
 
-**File restoration after `/tree` or `/fork` can overwrite unsnapshotted edits.** Read the [restoration rules](#restoring-files) before using these commands.
+**With file restoration enabled (the default), `/tree` or `/fork` can overwrite unsnapshotted edits.** Read the [restoration rules](#restoring-files) before using these commands.
 
 ## Install
 
@@ -22,7 +22,7 @@ To try it for one invocation:
 pi -e git:github.com/nosweet789/pi-tree-versioning
 ```
 
-Temporary loading leaves package declarations unchanged. Downloaded files are cached, and session history, snapshots, and saved language preferences use their normal storage.
+Temporary loading leaves package declarations unchanged. Downloaded files are cached, and session history, snapshots, and saved language and restoration preferences use their normal storage.
 
 `pi install` adds the package to your user settings. Add `--local` to use the project's `.pi/settings.json`; project resources load after you grant trust. Other existing settings are preserved.
 
@@ -65,9 +65,23 @@ Cards display the comparison saved at capture time and render in the current lan
 
 ## Restoring files
 
+Automatic file restoration is **on by default**. Use these commands to check or change it:
+
+```text
+/tree-versioning-restore
+/tree-versioning-restore off
+/tree-versioning-restore on
+```
+
+No argument, or `help`, shows the current state and usage. The choice is saved globally in the extension's `tree-versioning/preferences.json`, under the pi data directory. It applies across workspaces, new sessions, session switches, reloads, and restarts; a new session does **not** reset it to on. Other already-running pi instances pick up the saved choice when their extension runtime reloads, for example with `/reload`.
+
+With restoration **off**, `/tree` and `/fork` keep current disk files. Baseline and checkpoint capture, diff cards and queries, and fork/clone snapshot inheritance continue normally. A subsequent round records the actual disk state, even if it differs from the conversation's historical position.
+
+Turning restoration off invalidates pending restores that have not started writing; turning it back on cannot revive them. Turning it on does **not** restore the current position immediately or replay earlier navigation. Only subsequent navigation or forks can restore files. Switching does not interrupt a synchronous write already in progress.
+
 **Restoration directly applies the target snapshot. It overwrites unsnapshotted managed-file edits and deletes new managed files absent from the target. There is no merge, extra backup, or added confirmation. Back up important edits before navigating.**
 
-| Operation | File behavior |
+| Operation | File behavior with restoration on |
 | --- | --- |
 | Successful `/tree` navigation | Restore the actual destination's saved state |
 | Successful `/fork` in the same workspace | Inherit history, then restore the fork destination |
@@ -81,6 +95,7 @@ A fork or clone inherits the source baseline and only the copied path's checkpoi
 
 ### When an operation fails
 
+- **Preference failures:** if loading or reading preferences before a save fails, the extension reports the error and disables restoration for that runtime; file-history initialization and collection remain independent. Damaged preferences are left untouched: correct the file, then reload or retry the command. If only writing fails, the previous choice remains and no successful save is reported.
 - **Capture failure:** the extension reports that the round was not recorded. If only the diff comparison fails, the checkpoint remains recorded and its card reports the comparison error.
 - **Missing, damaged, or uncovered history:** files stay in place and the extension reports the unavailable history. Queries report an error rather than an empty diff or a substitute from another branch.
 - **Restore failure:** the native conversation destination remains selected, and **files may be partially restored**. If a fork already succeeded, the child session remains. Inspect the files, resolve the error, then navigate away and back to retry.
@@ -89,8 +104,9 @@ On first activation in an existing session, the baseline covers the activation p
 
 ## Agent tools
 
-Ask the agent to inspect file history using these read-only tools:
+Ask the agent to inspect restoration status and file history using these read-only tools:
 
+- `tree_versioning_status`: no parameters; returns the current runtime's effective `{ "restoreEnabled": true }` or `{ "restoreEnabled": false }`. It does not scan files, restore them, or change preferences. Use the user command above to change the switch.
 - `session_checkpoints`: list the session's baseline, checkpoints, native node associations, and the current position's applicable snapshot.
 - `session_diff`: compare saved states or the current workspace, with explicit endpoints.
 

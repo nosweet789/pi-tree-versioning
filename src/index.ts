@@ -1,10 +1,11 @@
 import { getAgentDir, truncateHead, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
-import { checkpointsOutput, checkpointsParameters, diffOutput, diffParameters } from "./tool-contract.ts";
-export type { CheckpointsInput, DiffInput } from "./tool-contract.ts";
+import { checkpointsOutput, checkpointsParameters, diffOutput, diffParameters, statusOutput, statusParameters } from "./tool-contract.ts";
+export type { CheckpointsInput, DiffInput, StatusInput } from "./tool-contract.ts";
 import { SessionFiles, type SessionPosition } from "./session-files.ts";
 import { VersioningError } from "./errors.ts";
 import { isLanguagePreference, Language } from "./language.ts";
+import { Preferences } from "./preferences.ts";
 import { exportOutput } from "./tool-output.ts";
 import { diffView, showDiff } from "./diff-view.ts";
 
@@ -40,15 +41,19 @@ export default async function treeVersioning(pi: ExtensionAPI) {
   pi.on("session_shutdown", async (event, ctx) => {
     active = false;
     restoreGeneration++;
+    await preferences.waitForSaves();
     if (event.reason === "fork") {
       try { await files.finishFork(position(ctx), event.targetSessionFile); }
       catch { reportError(ctx, language.message("inheritanceFailed")); }
     }
   });
   pi.on("before_agent_start", () => { restoreGeneration++; });
-  const language = new Language(join(storage, "preferences.json"));
+  const preferences = new Preferences(join(storage, "preferences.json"));
+  const language = new Language(() => preferences.language);
   let preferenceError: unknown;
-  try { await language.load(); } catch (error) { preferenceError = error; }
+  try { await preferences.load(); } catch (error) { preferenceError = error; }
+  let pendingRestoreChanges = 0;
+  const restorationEnabled = () => preferences.restoreEnabled && pendingRestoreChanges === 0;
 
   const registerDiffCommand = () => pi.registerCommand("tree-versioning-diff", {
     description: language.message("diffCommand"),
@@ -71,19 +76,41 @@ export default async function treeVersioning(pi: ExtensionAPI) {
     },
   });
   registerDiffCommand();
+  const registerRestoreCommand = () => pi.registerCommand("tree-versioning-restore", {
+    description: language.message("restoreCommand"),
+    getArgumentCompletions: prefix => ["on", "off"].filter(value => value.startsWith(prefix)).map(value => ({ value, label: value })),
+    handler: async (args, ctx) => {
+      const choice = args.trim();
+      if (choice !== "on" && choice !== "off") {
+        notify(ctx, language.message("restoreHelp", { state: language.message(restorationEnabled() ? "restoreOn" : "restoreOff") }), "info");
+        return;
+      }
+      restoreGeneration++;
+      pendingRestoreChanges++;
+      try {
+        await preferences.save({ restoreEnabled: choice === "on" });
+        notify(ctx, language.message("restoreSaved", { state: language.message(preferences.restoreEnabled ? "restoreOn" : "restoreOff") }) + " " +
+          language.message(preferences.restoreEnabled ? "restorePolicy" : "restoreDisabled"), "info");
+      } catch (error) {
+        reportError(ctx, language.message("preferences_failed") + " " + String(error));
+      } finally { pendingRestoreChanges--; }
+    },
+  });
+  registerRestoreCommand();
   const registerLanguageCommand = () => pi.registerCommand("tree-versioning-language", {
     description: language.message("languageCommand"),
     getArgumentCompletions: prefix => ["en", "zh-CN", "auto"].filter(value => value.startsWith(prefix)).map(value => ({ value, label: value })),
     handler: async (args, ctx) => {
       const choice = args.trim();
       if (!isLanguagePreference(choice)) {
-        notify(ctx, language.message("languageHelp", { preference: language.preference }), "info");
+        notify(ctx, language.message("languageHelp", { preference: preferences.language }), "info");
         return;
       }
       try {
-        await language.save(choice);
+        await preferences.save({ language: choice });
         registerLanguageCommand();
         registerDiffCommand();
+        registerRestoreCommand();
         notify(ctx, language.message("languageSaved", { preference: choice }), "info");
       } catch (error) {
         reportError(ctx, language.message("preferences_failed") + " " + String(error));
@@ -99,6 +126,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
         const descriptions = ([
           { name: "tree-versioning-language", key: "languageCommand" },
           { name: "tree-versioning-diff", key: "diffCommand" },
+          { name: "tree-versioning-restore", key: "restoreCommand" },
         ] as const).map(({ name, key }) => ({ name, key, cached: language.message(key) }));
         return {
           triggerCharacters: current.triggerCharacters,
@@ -130,7 +158,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
         pi.appendEntry("tree-versioning.baseline", baseline);
         notify(ctx, language.message("baselineCreated"), "info");
       }
-      notify(ctx, language.message("restorePolicy"), "info");
+      notify(ctx, language.message(preferences.restoreEnabled ? "restorePolicy" : "restoreDisabled"), "info");
     } catch (error) {
       const reason = error instanceof VersioningError ? language.message(error.code) : String(error);
       reportError(ctx, event.reason === "fork" ? language.message("inheritanceFailed") + " " + reason : language.message("startupFailed", { reason }));
@@ -160,10 +188,11 @@ export default async function treeVersioning(pi: ExtensionAPI) {
   });
 
   const restore = async (destination: SessionPosition, ctx: ExtensionContext) => {
+    if (!restorationEnabled()) return;
     const generation = ++restoreGeneration;
     try {
       const restored = await files.restore(destination, () => {
-        if (!active || generation !== restoreGeneration || !ctx.isIdle()) return false;
+        if (!active || !restorationEnabled() || generation !== restoreGeneration || !ctx.isIdle()) return false;
         const branch = ctx.sessionManager.getBranch();
         const index = destination.leafId === null ? -1 : branch.findIndex(entry => entry.id === destination.leafId);
         return (destination.leafId === null || index !== -1) &&
@@ -213,6 +242,17 @@ export default async function treeVersioning(pi: ExtensionAPI) {
       (fullOutputPath ? "\n" + language.message("outputTruncated", { path: fullOutputPath }) : "");
     return { text, fullOutputPath };
   };
+
+  pi.registerTool({
+    name: "tree_versioning_status", get label() { return language.message("statusLabel"); },
+    description: "Read whether automatic file restoration is currently enabled in this runtime. Returns restoreEnabled; does not scan the workspace or change files, preferences, or history. The switch controls native /tree and /fork restoration, not checkpoint collection or diff queries.",
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    parameters: statusParameters, outputSchema: statusOutput,
+    async execute() {
+      const details = { restoreEnabled: restorationEnabled() };
+      return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details, structuredContent: details };
+    },
+  });
 
   pi.registerTool({
     name: "session_checkpoints", get label() { return language.message("checkpointsLabel"); },

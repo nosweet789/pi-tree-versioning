@@ -49,12 +49,16 @@ async function inspectLoaded(workspace: Fixture, args: string[] = [], language =
     const command = commands.find(value => value.name === "tree-versioning-diff");
     assert.ok(command, "The installed package must register its diff command");
     assert.match(command.description!, language === "en" ? /saved session diff/ : /会话总差异/);
+    const restoreCommand = commands.find(value => value.name === "tree-versioning-restore");
+    assert.ok(restoreCommand, "The installed package must register its restoration command");
+    assert.match(restoreCommand.description!, language === "en" ? /automatic file restoration/ : /自动恢复文件/);
     const before = await client.getEntries();
     assert.ok(before.entries.some(entry => entry.type === "custom" && entry.customType === "tree-versioning.baseline"));
+    assert.equal(await client.prompt("/tree-versioning-restore off"), "handled");
     assert.equal(await client.prompt("/tree-versioning-language zh-CN"), "handled");
     const localized = (await client.getCommands()).find(value => value.name === "tree-versioning-diff")!;
     assert.match(localized.description!, /会话总差异/);
-    assert.deepEqual(await client.getEntries(), before, "Language selection must not append history or start a model");
+    assert.deepEqual(await client.getEntries(), before, "Preference commands must not append history or start a model");
     return dirname(dirname(command.sourceInfo.path));
   } finally { await client.stop(); }
 }
@@ -74,7 +78,7 @@ test("the local archive includes its explicit entry, both languages, license, an
   assert.equal(manifest.devDependencies["@earendil-works/pi-coding-agent"], "1.5.2");
   const preview = JSON.parse((await run("npm", ["pack", "--dry-run", "--json"])).stdout)[0];
   const paths: string[] = preview.files.map((file: { path: string }) => file.path);
-  for (const path of ["package.json", "src/index.ts", "src/locales/en.ts", "src/locales/zh-CN.ts", "README.md", "README.zh-CN.md", "LICENSE"]) {
+  for (const path of ["package.json", "src/index.ts", "src/preferences.ts", "src/locales/en.ts", "src/locales/zh-CN.ts", "README.md", "README.zh-CN.md", "LICENSE"]) {
     assert.ok(paths.includes(path), path);
   }
   for (const path of paths) {
@@ -93,7 +97,7 @@ test("the local archive includes its explicit entry, both languages, license, an
   context.diagnostic(JSON.stringify({ archive: packed.filename, bytes: packed.size, shasum: packed.shasum, files: paths }));
 });
 
-test("temporary local loading preserves pi settings and persists only the extension language preference", async () => {
+test("temporary local loading preserves pi settings and persists extension preferences", async () => {
   const workspace = await fixture();
   const settingsPath = join(workspace.agentDir, "settings.json");
   const settingsText = JSON.stringify(initialSettings, null, 2) + "\n";
@@ -130,9 +134,11 @@ test("pi local installation changes only the requested package declaration and r
 
 async function verifyInstalledRuntime(installed: string) {
   const result = await run(process.execPath, ["--import", "./test/isolate.mjs", "--import", "tsx", "--test", "--test-concurrency=1",
-    "test/checkpoints.test.ts", "test/restore.test.ts", "test/diff-views.test.ts", "test/inheritance-views.test.ts"],
+    "test/checkpoints.test.ts", "test/restore.test.ts", "test/diff-views.test.ts", "test/inheritance-views.test.ts",
+    "test/restore-preference.test.ts", "test/restore-toggle.test.ts", "test/restore-concurrency.test.ts",
+    "test/status.test.ts", "test/model-context.test.ts", "test/restart.test.ts"],
   sourceRoot, { ...environment, TREE_VERSIONING_TEST_PACKAGE: installed });
-  return "Installed artifact: checkpoints, queries, restoration, diff UI, inherited bilingual cards\n" +
+  return "Installed artifact: checkpoints, queries, restoration switch, status tool, persistence, diff UI, inherited bilingual cards\n" +
     result.stdout.split("\n").filter(line => /^(?:ℹ|# (?:tests|pass|fail|skipped))/.test(line)).join("\n");
 }
 
