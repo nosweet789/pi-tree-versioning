@@ -49,9 +49,12 @@ test("large diff output is bounded and points to a complete comparison outside t
     assert.ok(Buffer.byteLength(text) < 53 * 1024);
     const output = (result.details as any).output;
     assert.equal(output.truncated, true);
+    assert.equal(output.totalRepositories, 1);
+    assert.equal((result.details as any).coverage, undefined);
     assert.ok(!output.fullOutputPath.startsWith(testWorkspace.cwd));
     const full = JSON.parse(await readFile(output.fullOutputPath, "utf8"));
     assert.equal(full.files[0].additions, 6000);
+    assert.deepEqual(full.coverage, { searchDepth: 0, repositories: ["."] });
     assert.deepEqual(app.manager.getEntries(), entries);
   } finally { dispose(app.session); }
 });

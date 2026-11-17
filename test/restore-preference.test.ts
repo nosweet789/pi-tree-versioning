@@ -165,7 +165,8 @@ for (const damage of ["corrupt", "unreadable", "link-loop"] as const) {
   });
 }
 
-for (const content of ["{invalid", "null", "[]", '{"language":"en","restoreEnabled":"off"}', '{"language":"invalid","restoreEnabled":false}']) {
+for (const content of ["{invalid", "null", "[]", '{"language":"en","restoreEnabled":"off"}', '{"language":"invalid","restoreEnabled":false}',
+  '{"repositoryDepths":null}', '{"repositoryDepths":[]}', '{"repositoryDepths":{"/invalid":-1}}']) {
   test(`unreadable preferences disable restoration without blocking collection: ${content}`, async () => {
     const workspace = await fixture();
     const storage = join(workspace.agentDir, "tree-versioning");

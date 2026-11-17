@@ -151,7 +151,9 @@ for (const widgetRows of [0, 4, 12]) {
         for (let line = 0; line < 150; line++) view.sendKey("\x1b[B");
         assert.match(view.screenLines().map(stripVTControlCharacters).join("\n"), /FINAL-DIFF-LINE/);
         view.resize(24, 12);
-        for (let page = 0; page < 20; page++) view.sendKey("\x1b[6~");
+        for (let page = 0; page < 200 && !view.screenLines().some(line => line.includes("FINAL-DIFF-LINE")); page++) {
+          view.sendKey("\x1b[6~");
+        }
         assert.match(view.screenLines().map(stripVTControlCharacters).join("\n"), /FINAL-DIFF-LINE/);
         assert.ok(view.screenLines().every(line => visibleWidth(line) <= 24));
       });

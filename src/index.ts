@@ -7,7 +7,8 @@ import { VersioningError } from "./errors.ts";
 import { isLanguagePreference, Language } from "./language.ts";
 import { Preferences } from "./preferences.ts";
 import { exportOutput } from "./tool-output.ts";
-import { diffView, showDiff } from "./diff-view.ts";
+import { diffView, showDiff, terminalText } from "./diff-view.ts";
+import { isSearchDepth, workspaceRoot, type repositoryCoverage } from "./repositories.ts";
 
 function position(ctx: ExtensionContext): SessionPosition {
   return {
@@ -32,6 +33,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
   const storage = join(getAgentDir(), "tree-versioning");
   const files = new SessionFiles(storage);
   let activeWorkspaceRoot: string | undefined;
+  let activeCoverage: ReturnType<typeof repositoryCoverage> | undefined;
   let restoreGeneration = 0;
   let active = true;
   pi.on("session_before_fork", async (event, ctx) => {
@@ -97,6 +99,24 @@ export default async function treeVersioning(pi: ExtensionAPI) {
     },
   });
   registerRestoreCommand();
+  const registerDepthCommand = () => pi.registerCommand("tree-versioning-repository-depth", {
+    description: language.message("repositoryDepthCommand"),
+    handler: async (args, ctx) => {
+      const choice = args.trim();
+      try {
+        const root = activeWorkspaceRoot ?? await workspaceRoot(ctx.cwd);
+        if (choice && /^(0|[1-9][0-9]*)$/.test(choice) && isSearchDepth(Number(choice))) {
+          await preferences.saveRepositoryDepth(root, Number(choice));
+          notify(ctx, language.message("repositoryDepthSaved", { depth: Number(choice) }), "info");
+          return;
+        }
+        notify(ctx, language.message("repositoryDepthHelp", { depth: preferences.repositoryDepth(root) }) + "\n" +
+          (activeCoverage ? language.message("repositoryCoverage", { depth: activeCoverage.searchDepth,
+            repositories: terminalText(JSON.stringify(activeCoverage.repositories)) }) : language.message("repositoryCoverageUnavailable")), "info");
+      } catch (error) { reportError(ctx, language.message("preferences_failed") + " " + String(error)); }
+    },
+  });
+  registerDepthCommand();
   const registerLanguageCommand = () => pi.registerCommand("tree-versioning-language", {
     description: language.message("languageCommand"),
     getArgumentCompletions: prefix => ["en", "zh-CN", "auto"].filter(value => value.startsWith(prefix)).map(value => ({ value, label: value })),
@@ -111,6 +131,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
         registerLanguageCommand();
         registerDiffCommand();
         registerRestoreCommand();
+        registerDepthCommand();
         notify(ctx, language.message("languageSaved", { preference: choice }), "info");
       } catch (error) {
         reportError(ctx, language.message("preferences_failed") + " " + String(error));
@@ -127,6 +148,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
           { name: "tree-versioning-language", key: "languageCommand" },
           { name: "tree-versioning-diff", key: "diffCommand" },
           { name: "tree-versioning-restore", key: "restoreCommand" },
+          { name: "tree-versioning-repository-depth", key: "repositoryDepthCommand" },
         ] as const).map(({ name, key }) => ({ name, key, cached: language.message(key) }));
         return {
           triggerCharacters: current.triggerCharacters,
@@ -150,13 +172,18 @@ export default async function treeVersioning(pi: ExtensionAPI) {
     if (preferenceError) notify(ctx, language.message("preferences_failed") + " " + String(preferenceError), "error");
     let restoreFork = false;
     try {
-      const initialized = await files.initialize(position(ctx), event.reason);
+      const initialized = await files.initialize(position(ctx), event.reason, root => preferences.repositoryDepth(root));
       const { baseline, created, workspaceRoot } = initialized;
       restoreFork = initialized.restore;
       activeWorkspaceRoot = workspaceRoot;
+      activeCoverage = initialized.coverage;
       if (created) {
         pi.appendEntry("tree-versioning.baseline", baseline);
         notify(ctx, language.message("baselineCreated"), "info");
+      }
+      if (activeCoverage.searchDepth > 0) {
+        notify(ctx, language.message("repositoryCoverage", { depth: activeCoverage.searchDepth,
+          repositories: terminalText(JSON.stringify(activeCoverage.repositories)) }), "info");
       }
       notify(ctx, language.message(preferences.restoreEnabled ? "restorePolicy" : "restoreDisabled"), "info");
     } catch (error) {
@@ -256,7 +283,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "session_checkpoints", get label() { return language.message("checkpointsLabel"); },
-    description: "Read available file checkpoints and native node associations for this session. Output is limited to 2000 lines / 50 KiB; larger catalogs are exported to a private temporary JSON file.",
+    description: "Read available file checkpoints, native node associations, and frozen repository coverage for this session. Output is limited to 2000 lines / 50 KiB; larger catalogs are exported to a private temporary JSON file.",
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     parameters: checkpointsParameters, outputSchema: checkpointsOutput,
     async execute(_id, _params, _signal, _onUpdate, ctx) {
@@ -264,9 +291,10 @@ export default async function treeVersioning(pi: ExtensionAPI) {
         const catalog = await files.checkpoints(position(ctx));
         const { text, fullOutputPath } = await queryOutput(catalog, catalog.workspaceRoot, "checkpoints.json",
           language.message("checkpoints", { count: catalog.checkpoints.length }));
-        const { checkpoints: _checkpoints, ...association } = catalog;
+        const { checkpoints: _checkpoints, coverage: _coverage, ...association } = catalog;
         const details = fullOutputPath ? {
-          ...association, output: { truncated: true as const, fullOutputPath, totalCheckpoints: catalog.checkpoints.length },
+          ...association, output: { truncated: true as const, fullOutputPath, totalCheckpoints: catalog.checkpoints.length,
+            totalRepositories: catalog.coverage.repositories.length },
         } : catalog;
         return { content: [{ type: "text" as const, text }], details, structuredContent: details };
       } catch (error) { return queryError(error); }
@@ -275,7 +303,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "session_diff", get label() { return language.message("diffLabel"); },
-    description: "Read round, saved-session, or unsnapshotted workspace differences with explicit endpoints and optional exact file filters. Text is limited to 2000 lines / 50 KiB; larger comparisons are exported to a private temporary JSON file, not a checkpoint.",
+    description: "Read round, saved-session, or unsnapshotted workspace differences with explicit endpoints, frozen repository coverage, and optional exact outer-workspace-relative file filters. Text is limited to 2000 lines / 50 KiB; larger comparisons are exported to a private temporary JSON file, not a checkpoint.",
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     parameters: diffParameters,
     outputSchema: diffOutput,
@@ -284,9 +312,10 @@ export default async function treeVersioning(pi: ExtensionAPI) {
         const comparison = await files.diff(position(ctx), params);
         const { text, fullOutputPath } = await queryOutput(comparison, comparison.to.workspaceRoot, "comparison.json",
           language.message("comparison", { scope: comparison.scope, count: comparison.files.length }));
-        const { files: _fileChanges, ...comparisonEndpoints } = comparison;
+        const { files: _fileChanges, coverage: _coverage, ...comparisonEndpoints } = comparison;
         const details = fullOutputPath ? {
-          ...comparisonEndpoints, output: { truncated: true as const, fullOutputPath, totalFiles: comparison.files.length },
+          ...comparisonEndpoints, output: { truncated: true as const, fullOutputPath, totalFiles: comparison.files.length,
+            totalRepositories: comparison.coverage.repositories.length },
         } : comparison;
         return { content: [{ type: "text" as const, text }], details, structuredContent: details };
       } catch (error) { return queryError(error); }

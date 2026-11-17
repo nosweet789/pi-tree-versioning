@@ -22,7 +22,7 @@ To try it for one invocation:
 pi -e git:github.com/nosweet789/pi-tree-versioning
 ```
 
-Temporary loading leaves package declarations unchanged. Downloaded files are cached, and session history, snapshots, and saved language and restoration preferences use their normal storage.
+Temporary loading leaves package declarations unchanged. Downloaded files are cached, and session history, snapshots, and saved extension preferences use their normal storage.
 
 `pi install` adds the package to your user settings. Add `--local` to use the project's `.pi/settings.json`; project resources load after you grant trust. Other existing settings are preserved.
 
@@ -98,6 +98,7 @@ A fork or clone inherits the source baseline and only the copied path's checkpoi
 ### When an operation fails
 
 - **Preference failures:** if loading or reading preferences before a save fails, the extension reports the error and disables restoration for that runtime; file-history initialization and collection remain independent. Damaged preferences are left untouched: correct the file, then reload or retry the command. If only writing fails, the previous choice remains and no successful save is reported.
+- **Busy preference lock:** preference saves are serialized across pi processes. If the lock stays busy for five seconds, the save fails instead of overwriting another writer. A terminated writer can leave `tree-versioning/preferences.json.lock` under the pi data directory. Stop all pi processes using that data directory before removing this lock directory and retrying.
 - **Capture failure:** the extension reports that the round was not recorded. If only the diff comparison fails, the checkpoint remains recorded and its card reports the comparison error.
 - **Missing, damaged, or uncovered history:** files stay in place and the extension reports the unavailable history. Queries report an error rather than an empty diff or a substitute from another branch.
 - **Restore failure:** the native conversation destination remains selected, and **files may be partially restored**. If a fork already succeeded, the child session remains. Inspect the files, resolve the error, then navigate away and back to retry.
@@ -109,8 +110,8 @@ On first activation in an existing session, the baseline covers the activation p
 Ask the agent to inspect restoration status and file history using these read-only tools:
 
 - `tree_versioning_status`: no parameters; returns the current runtime's effective `{ "restoreEnabled": true }` or `{ "restoreEnabled": false }`. It does not scan files, restore them, or change preferences. Use the user command above to change the switch.
-- `session_checkpoints`: list the session's baseline, checkpoints, native node associations, and the current position's applicable snapshot.
-- `session_diff`: compare saved states or the current workspace, with explicit endpoints.
+- `session_checkpoints`: list the session's baseline, checkpoints, native node associations, applicable snapshot, and frozen repository coverage.
+- `session_diff`: compare saved states or the current workspace, with explicit endpoints and repository coverage.
 
 | `scope` | From | To |
 | --- | --- | --- |
@@ -118,21 +119,40 @@ Ask the agent to inspect restoration status and file history using these read-on
 | `turn` | Selected checkpoint's preceding checkpoint, or applicable baseline | Selected checkpoint |
 | `session` | Session baseline | Current path's saved checkpoint |
 
-For `turn`, optional `checkpointId` selects an ID from `session_checkpoints`; omitting it uses the current path's nearest checkpoint. Optional `files` filters by exact repository-relative paths, with an optional leading `@`. These are exact paths, not globs; an empty array selects no files.
+For `turn`, optional `checkpointId` selects an ID from `session_checkpoints`; omitting it uses the current path's nearest checkpoint. Optional `files` filters by exact outer-workspace-relative paths, including nested prefixes such as `nested/notes.txt`, with an optional leading `@`. These are exact paths, not globs; an empty array selects no files.
 
 Before the first checkpoint, `session` compares the baseline to itself and `turn` reports `no_checkpoint`. A missing or damaged required snapshot is an error. Queries leave workspace files, the native tree position, and checkpoints unchanged; the normal end-of-round capture still runs after an agent round containing only queries.
 
-Tool output is limited to approximately **50 KiB / 2000 lines**. Larger results provide `output.fullOutputPath`, a private temporary JSON file containing the full result. In that case, an omitted `files` or `checkpoints` array means the result was exported, not that it was empty.
+Tool output is limited to approximately **50 KiB / 2000 lines**. Larger results provide `output.fullOutputPath`, a private temporary JSON file containing the full result. In that case, omitted `files`, `checkpoints`, or `coverage` data is in the export, not empty; `output.totalRepositories` gives the repository count.
+
+## Nested repositories
+
+To include ordinary independent repositories inside your workspace, set a search depth, then start a **new session**:
+
+```text
+/tree-versioning-repository-depth 1
+/new
+```
+
+The default is **0** (only the outer repository). Depth counts directory levels from the outer Git root: `nested/` is depth 1 and `packages/example/` is depth 2. It does not reset at each repository. Without an argument, the command shows the configured depth and the current session's actual coverage. The setting is saved per workspace in the extension's preferences; it does not change Git or pi settings.
+
+A new baseline automatically includes **all qualifying repositories** within the depth, including repositories under parent-ignored directories—not only those the agent edits. Each repository uses its own tracked-file and ignore rules. Cards and queries show the covered repository paths (`.` means the outer root), and file paths retain their outer-workspace prefix.
+
+**Included repositories participate in file restoration.** With restoration on, `/tree` and `/fork` can overwrite their unsnapshotted managed edits without a backup. `/clone` inherits coverage and history without restoring files.
+
+Coverage is fixed when the baseline is created. Raising or lowering the setting, reloading, or reopening does not change an existing session; fork/clone inherit the source coverage regardless of the current preference. Earlier-format sessions remain root-only. Repositories created later are not automatically enrolled. If a newly created repository intersects saved managed paths, capture and restoration fail rather than treating the transition as ordinary file deletion.
+
+Search does not follow directory symlinks or enter Git administrative data, submodules, or nested worktrees/redirected Git directories. It is limited to 10,000 examined directory entries, 256 repositories including the outer root, and a 30-second discovery budget. Search failures or exhausted limits do not publish a partial baseline. Missing, inaccessible, replaced, or administratively relocated enrolled repositories prevent capture and fail restoration preflight before any repository's files are written. Resolve the problem before retrying; Git branch or HEAD changes alone do not change repository identity.
 
 ## File scope and storage
 
-The extension manages the **whole Git working tree**, including when pi starts in a subdirectory:
+By default, the extension manages the **whole outer Git working tree**, including when pi starts in a subdirectory. Enrolled nested repositories use the same rules independently:
 
 - Tracked files, including tracked paths that match ignore rules.
 - Non-ignored untracked files.
 - File additions, deletions, binary contents, executable flags, and symbolic links.
 
-Untracked ignored files, Git administrative data, submodule contents, and paths outside the working tree are excluded. Symbolic links are stored as links rather than followed. The extension preserves Git HEAD, branch selection, and the index.
+Files ignored and untracked by their owning repository, unenrolled nested repositories, Git administrative data, submodule contents, and paths outside the outer working tree are excluded. Symbolic links are stored as links rather than followed. The extension preserves Git HEAD, branch selection, and the index.
 
 Snapshots live under `~/.pi/agent/tree-versioning/<session-id>/`, following `PI_CODING_AGENT_DIR` when set. Keep the pi data directory and session files outside the managed working tree. Persistent sessions retain their file history across restarts; `--no-session` conversations end with the process.
 

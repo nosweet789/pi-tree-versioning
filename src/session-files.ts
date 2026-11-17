@@ -1,16 +1,13 @@
 import type { SessionEntry, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { isUtf8 } from "node:buffer";
-import { execFile } from "node:child_process";
-import { constants, lstatSync, mkdirSync, readdirSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, constants, lstatSync, mkdirSync, readdirSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { link, lstat, mkdir, mkdtemp, open, readlink, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
-import { promisify } from "node:util";
+import { link, lstat, mkdir, mkdtemp, open, readlink, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { formatPatch, structuredPatch } from "diff";
 import { VersioningError, type ErrorCode } from "./errors.ts";
 import { canonicalLocation, isWithin } from "./paths.ts";
-
-const exec = promisify(execFile);
+import { discoverRepositories, isRepositoryScope, repositoryCoverage, validPath, workspaceRoot, workspaceScope, type RepositoryScope } from "./repositories.ts";
 
 export interface SessionPosition {
   sessionId: string;
@@ -29,7 +26,8 @@ type FileState = { kind: "file"; content: string; executable: boolean } |
   { kind: "symlink"; target: string; targetEncoding: "utf8" | "base64" };
 
 interface FileSnapshot {
-  version: 1;
+  version: 1 | 2;
+  repositoryScope?: RepositoryScope;
   sessionId: string;
   workspaceRoot: string;
   files: Record<string, FileState>;
@@ -57,12 +55,6 @@ function isCheckpoint(value: unknown): value is Checkpoint {
     typeof checkpoint.nodeId === "string" && typeof checkpoint.capturedAt === "string";
 }
 
-function validPath(path: string): boolean {
-  return !path.includes("\0") && !isAbsolute(path) &&
-    !(sep === "\\" && (path.includes("\\") || /^[a-z]:/i.test(path))) &&
-    !path.split("/").some(segment => ["", ".", "..", ".git"].includes(segment.toLowerCase()));
-}
-
 function checksum(snapshot: FileSnapshot): string {
   return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
 }
@@ -71,7 +63,8 @@ function parseSnapshot(text: string, kind: "baseline"): Snapshot;
 function parseSnapshot(text: string, kind: "checkpoint"): CheckpointSnapshot;
 function parseSnapshot(text: string, kind: "baseline" | "checkpoint"): Snapshot | CheckpointSnapshot {
   const { integrity, ...value } = JSON.parse(text);
-  if (integrity !== checksum(value as Snapshot) || value.version !== 1 ||
+  if (integrity !== checksum(value as Snapshot) || ![1, 2].includes(value.version) ||
+      (value.version === 2 ? !isRepositoryScope(value.repositoryScope) : value.repositoryScope !== undefined) ||
       typeof value.sessionId !== "string" || typeof value.workspaceRoot !== "string" ||
       !value.files || typeof value.files !== "object" || Array.isArray(value.files) ||
       (kind === "checkpoint" ? !isCheckpoint(value.checkpoint) :
@@ -102,85 +95,14 @@ function parseSnapshot(text: string, kind: "baseline" | "checkpoint"): Snapshot 
   return value as Snapshot | CheckpointSnapshot;
 }
 
-async function git(cwd: string, args: string[], input?: string): Promise<string> {
-  const environment = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
-  for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"]) {
-    delete (environment as NodeJS.ProcessEnv)[key];
-  }
-  const command = exec("git", ["-C", cwd, ...args], {
-    env: environment, encoding: "buffer", maxBuffer: 64 * 1024 * 1024, timeout: 30_000,
-  });
-  const inputComplete = input === undefined ? Promise.resolve() : new Promise<void>((resolve, reject) => {
-    const stream = command.child.stdin!;
-    stream.on("error", reject);
-    stream.end(input, (error?: Error | null) => error ? reject(error) : resolve());
-  });
-  const [{ stdout }] = await Promise.all([command.catch(error => {
-    if (args[0] === "check-ignore" && error.code === 1) return { stdout: Buffer.alloc(0) };
-    throw error;
-  }), inputComplete]);
-  if (!isUtf8(stdout)) throw new Error("Git returned paths that are not valid UTF-8");
-  return stdout.toString("utf8");
-}
-
-async function workspaceRoot(cwd: string): Promise<string> {
-  const output = await git(cwd, ["rev-parse", "--show-toplevel"]);
-  return realpath(output.replace(/\r?\n$/, ""));
-}
-
-async function capture(root: string): Promise<Record<string, FileState>> {
-  try { return await collect(root); }
-  catch (error) {
+async function capture(root: string, repositories?: RepositoryScope, knownPaths: string[] = []): Promise<Record<string, FileState>> {
+  try {
+    const scope = await workspaceScope(root, repositories);
+    await scope.assertOwnership(knownPaths);
+    return await collect(root, scope);
+  } catch (error) {
     throw new VersioningError("capture_failed", error instanceof Error ? error.message : String(error));
   }
-}
-
-async function entryLocation(path: string) {
-  const stat = await lstat(path).catch(error => {
-    if (!["ENOENT", "ENOTDIR"].includes(error.code)) throw error;
-    return undefined;
-  });
-  // Resolve filesystem spelling without following a leaf symbolic link.
-  const location = stat && !stat.isSymbolicLink() ? await realpath(path) :
-    join(await canonicalLocation(dirname(path)), basename(path));
-  return { location, stat };
-}
-
-async function workspaceScope(root: string) {
-  const tracked = await git(root, ["ls-files", "--stage", "-z"]);
-  const untracked = await git(root, ["ls-files", "--others", "--exclude-standard", "-z"]);
-  const administrativePaths = await Promise.all(["--absolute-git-dir", "--git-common-dir"].map(async flag => {
-    const output = await git(root, ["rev-parse", "--path-format=absolute", flag]);
-    return relative(root, await realpath(output.replace(/\r?\n$/, "")));
-  }));
-  const excluded = administrativePaths.filter(path => path !== ".." && !path.startsWith("../") && !isAbsolute(path));
-  const submodules: string[] = [];
-  const trackedPaths = new Set<string>();
-  const paths = new Set(untracked.split("\0").filter(Boolean));
-  for (const record of tracked.split("\0").filter(Boolean)) {
-    const separator = record.indexOf("\t");
-    const path = record.slice(separator + 1);
-    if (record.startsWith("160000 ")) submodules.push(path);
-    else { paths.add(path); trackedPaths.add(path); }
-  }
-  const exclusions = await Promise.all([...submodules, ...excluded].map(path => entryLocation(join(root, path))));
-  const marker = await lstat(join(root, ".git"));
-  const alternate = await lstat(join(root, ".GIT")).catch(error => {
-    if (error.code !== "ENOENT") throw error;
-    return undefined;
-  });
-  const caseInsensitive = alternate?.dev === marker.dev && alternate.ino === marker.ino;
-  const spelling = (path: string) => caseInsensitive ? path.normalize("NFD").toLowerCase() : path;
-  return {
-    paths, trackedPaths,
-    async excludes(path: string, replacingDirectory = false) {
-      const entry = await entryLocation(join(root, path));
-      return !isWithin(spelling(root), spelling(entry.location)) || exclusions.some(exclusion =>
-        isWithin(spelling(exclusion.location), spelling(entry.location)) ||
-        replacingDirectory && isWithin(spelling(entry.location), spelling(exclusion.location)) ||
-        entry.stat && exclusion.stat && entry.stat.dev === exclusion.stat.dev && entry.stat.ino === exclusion.stat.ino);
-    },
-  };
 }
 
 async function collect(root: string, scope?: Awaited<ReturnType<typeof workspaceScope>>): Promise<Record<string, FileState>> {
@@ -215,6 +137,7 @@ async function collect(root: string, scope?: Awaited<ReturnType<typeof workspace
       if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
     }
   }
+  await scope.verify();
   return files;
 }
 
@@ -277,6 +200,19 @@ function applySnapshot(root: string, current: Record<string, FileState>, target:
     const stat = statAt(path);
     if (stat?.isDirectory()) inspectDirectory(path);
     else if (stat && !stat.isFile() && !stat.isSymbolicLink()) throw new Error(`Unsupported restore target: ${path}`);
+  }
+  // Check permissions for every planned mutation before writing in any repository.
+  for (const path of new Set([...directories, ...Object.keys(current), ...Object.keys(target)])) {
+    if (!directories.has(path) && JSON.stringify(current[path]) === JSON.stringify(target[path])) continue;
+    let parent = dirname(join(root, path));
+    while (true) {
+      try { if (lstatSync(parent).isDirectory()) break; }
+      catch (error) { if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error; }
+      const next = dirname(parent);
+      if (next === parent) throw new Error("No accessible restoration parent: " + path);
+      parent = next;
+    }
+    accessSync(parent, constants.W_OK | constants.X_OK);
   }
   // The mutation window is synchronous: host navigation or runtime replacement cannot
   // interleave these writes. External concurrent filesystem writers are not supported.
@@ -389,7 +325,7 @@ export class SessionFiles {
     return join(this.storageDir, "transfer-" + createHash("sha256").update(identity).digest("hex") + ".json");
   }
 
-  async initialize(position: SessionPosition, reason: SessionStartEvent["reason"] = "startup") {
+  async initialize(position: SessionPosition, reason: SessionStartEvent["reason"] = "startup", searchDepth: (root: string) => number = () => 0) {
     const root = await workspaceRoot(position.cwd);
     await this.assertExternalPersistence(position, root);
     const fork = reason === "fork";
@@ -419,18 +355,21 @@ export class SessionFiles {
     }
     try {
       const existing = await this.load(position);
-      return { baseline: existing.baseline, created: !existing.inheritedCheckpoints && !fork && !this.hasBaselineRecord(position), workspaceRoot: root, restore };
+      return { baseline: existing.baseline, coverage: repositoryCoverage(existing.repositoryScope), created: !existing.inheritedCheckpoints && !fork && !this.hasBaselineRecord(position), workspaceRoot: root, restore };
     } catch (error) {
       if (!(error instanceof VersioningError) || error.code !== "no_baseline") throw error;
     }
     const hasConversation = position.entries.some(entry => entry.type === "message" && entry.message.role !== "system" || entry.type === "custom_message");
+    let repositoryScope: RepositoryScope;
+    try { repositoryScope = await discoverRepositories(root, searchDepth(root)); }
+    catch (error) { throw new VersioningError("capture_failed", String(error)); }
     const snapshot: Snapshot = {
-      version: 1, sessionId: position.sessionId, workspaceRoot: root,
+      version: 2, repositoryScope, sessionId: position.sessionId, workspaceRoot: root,
       baseline: {
         id: randomUUID(), capturedAt: new Date().toISOString(),
         anchorId: hasConversation ? position.leafId : null,
       },
-      files: await capture(root),
+      files: await capture(root, repositoryScope),
       priorEntryIds: hasConversation ? position.entries.map(entry => entry.id) : [],
     };
     try {
@@ -438,9 +377,10 @@ export class SessionFiles {
       try { await this.publishSnapshot(path, snapshot); }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        return { baseline: (await this.load(position)).baseline, created: !this.hasBaselineRecord(position), workspaceRoot: root, restore: false };
+        const existing = await this.load(position);
+        return { baseline: existing.baseline, coverage: repositoryCoverage(existing.repositoryScope), created: !this.hasBaselineRecord(position), workspaceRoot: root, restore: false };
       }
-      return { baseline: snapshot.baseline, created: true, workspaceRoot: root, restore: false };
+      return { baseline: snapshot.baseline, coverage: repositoryCoverage(snapshot.repositoryScope), created: true, workspaceRoot: root, restore: false };
     } catch (error) {
       throw new VersioningError("storage_failed", String(error));
     }
@@ -494,7 +434,7 @@ export class SessionFiles {
     for (const record of this.checkpointRecords(source, baseline)) {
       const nodeId = copiedNode(record.nodeId);
       if (nodeId) {
-        const snapshot = await this.loadCheckpoint(source, record, root);
+        const snapshot = await this.loadCheckpoint(source, record, root, baseline.repositoryScope);
         checkpoints.push({ ...snapshot, checkpoint: { id: record.id, capturedAt: record.capturedAt, nodeId } });
       }
     }
@@ -543,9 +483,19 @@ export class SessionFiles {
     await this.assertExternalPersistence(position, baseline.workspaceRoot);
     if (!position.leafId) throw new VersioningError("capture_failed", "The round has no native session node.");
     const checkpoint: Checkpoint = { id: randomUUID(), nodeId: position.leafId, capturedAt: new Date().toISOString() };
+    const previous = this.nearestCheckpoint(this.checkpointRecords(position, baseline), this.branchAt(position, position.leafId));
+    let known: FileSnapshot = baseline;
+    if (previous) {
+      try { known = await this.loadCheckpoint(position, previous, baseline.workspaceRoot, baseline.repositoryScope); }
+      catch (error) {
+        // A missing predecessor prevents its diff, not an independent capture of disk.
+        if (!(error instanceof VersioningError) || error.code !== "snapshot_unavailable") throw error;
+      }
+    }
     const snapshot: CheckpointSnapshot = {
-      version: 1, sessionId: position.sessionId, workspaceRoot: baseline.workspaceRoot,
-      checkpoint, files: await capture(baseline.workspaceRoot),
+      version: baseline.version, ...(baseline.repositoryScope ? { repositoryScope: baseline.repositoryScope } : {}),
+      sessionId: position.sessionId, workspaceRoot: baseline.workspaceRoot,
+      checkpoint, files: await capture(baseline.workspaceRoot, baseline.repositoryScope, Object.keys(known.files)),
     };
     try {
       const path = await this.storagePath(position.sessionId, false, "checkpoint-" + checkpoint.id + ".json");
@@ -588,13 +538,14 @@ export class SessionFiles {
     return [...merged.values()];
   }
 
-  private async loadCheckpoint(position: SessionPosition, checkpoint: Checkpoint, root: string) {
+  private async loadCheckpoint(position: SessionPosition, checkpoint: Checkpoint, root: string, scope?: RepositoryScope) {
     try {
       const path = await this.storagePath(position.sessionId, false, "checkpoint-" + checkpoint.id + ".json");
       const snapshot = parseSnapshot(await this.readRegularFile(path), "checkpoint");
       if (snapshot.sessionId !== position.sessionId || snapshot.workspaceRoot !== root ||
           snapshot.checkpoint.id !== checkpoint.id || snapshot.checkpoint.nodeId !== checkpoint.nodeId ||
-          snapshot.checkpoint.capturedAt !== checkpoint.capturedAt) {
+          snapshot.checkpoint.capturedAt !== checkpoint.capturedAt ||
+          JSON.stringify(snapshot.repositoryScope) !== JSON.stringify(scope)) {
         throw new Error("Checkpoint identity or association does not match.");
       }
       return snapshot;
@@ -633,12 +584,13 @@ export class SessionFiles {
     const records = this.checkpointRecords(position, snapshot);
     const checkpoints: ReturnType<SessionFiles["checkpointEndpoint"]>[] = [];
     for (const record of records) {
-      checkpoints.push(this.checkpointEndpoint(await this.loadCheckpoint(position, record, snapshot.workspaceRoot)));
+      checkpoints.push(this.checkpointEndpoint(await this.loadCheckpoint(position, record, snapshot.workspaceRoot, snapshot.repositoryScope)));
     }
     const branch = this.branchAt(position, position.leafId);
     const current = this.nearestCheckpoint(checkpoints, branch);
     return {
       status: "ok" as const, sessionId: position.sessionId, workspaceRoot: snapshot.workspaceRoot,
+      coverage: repositoryCoverage(snapshot.repositoryScope),
       baseline: this.baselineEndpoint(snapshot), checkpoints,
       current: { nodeId: position.leafId, snapshot: current ?? (this.baselineCovers(snapshot, branch) ? this.baselineEndpoint(snapshot) : null) },
     };
@@ -666,20 +618,11 @@ export class SessionFiles {
     if (!checkpoint && !this.baselineCovers(baseline, branch)) {
       throw new VersioningError("no_baseline", "No saved file history covers the navigation destination.");
     }
-    const snapshot = checkpoint ? await this.loadCheckpoint(position, checkpoint, baseline.workspaceRoot) : baseline;
+    const snapshot = checkpoint ? await this.loadCheckpoint(position, checkpoint, baseline.workspaceRoot, baseline.repositoryScope) : baseline;
     const root = snapshot.workspaceRoot;
     try {
-      const scope = await workspaceScope(root);
-      const targetPaths = Object.keys(snapshot.files);
-      for (const path of targetPaths) {
-        if (await scope.excludes(path, true)) {
-          throw new Error(`Restore would replace excluded content: ${path}`);
-        }
-      }
-      const untrackedTargets = targetPaths.filter(path => !scope.trackedPaths.has(path));
-      if (untrackedTargets.length && await git(root, ["check-ignore", "--no-index", "-z", "--stdin"], untrackedTargets.join("\0") + "\0")) {
-        throw new Error("Restore would replace an untracked ignored path.");
-      }
+      const scope = await workspaceScope(root, snapshot.repositoryScope);
+      await scope.assertRestorable(Object.keys(snapshot.files));
       const current = await collect(root, scope);
       if (!stillCurrent()) throw new VersioningError("restore_superseded", "The restore destination is no longer current.");
       applySnapshot(root, current, snapshot.files);
@@ -721,7 +664,7 @@ export class SessionFiles {
       return { endpoint: this.baselineEndpoint(snapshot), files: snapshot.files };
     };
     const saved = async (record: Checkpoint) => {
-      const savedSnapshot = await this.loadCheckpoint(position, record, snapshot.workspaceRoot);
+      const savedSnapshot = await this.loadCheckpoint(position, record, snapshot.workspaceRoot, snapshot.repositoryScope);
       return { endpoint: this.checkpointEndpoint(savedSnapshot), files: savedSnapshot.files };
     };
     const branch = checkpoint ? this.branchAt(position, checkpoint.nodeId) : currentBranch;
@@ -729,7 +672,7 @@ export class SessionFiles {
       checkpoint ? await saved(checkpoint) : baselineAt(branch);
     const previous = scope === "turn" ? this.nearestCheckpoint(records, branch.slice(0, -1)) : undefined;
     const source = scope === "workspace" ? target : scope === "turn" && previous ? await saved(previous) : baselineAt(branch);
-    const current = scope === "workspace" ? await capture(snapshot.workspaceRoot) : target.files;
+    const current = scope === "workspace" ? await capture(snapshot.workspaceRoot, snapshot.repositoryScope, Object.keys(source.files)) : target.files;
     const files = [];
     for (const path of [...new Set([...Object.keys(source.files), ...Object.keys(current)])].sort()) {
       if (selected && !selected.has(path)) continue;
@@ -739,7 +682,7 @@ export class SessionFiles {
       files.push(compare(path, before, after));
     }
     return {
-      status: "ok" as const, scope,
+      status: "ok" as const, scope, coverage: repositoryCoverage(snapshot.repositoryScope),
       from: source.endpoint,
       to: scope === "workspace" ? { kind: "workspace" as const, workspaceRoot: snapshot.workspaceRoot } : target.endpoint,
       files,

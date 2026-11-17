@@ -52,8 +52,12 @@ async function inspectLoaded(workspace: Fixture, args: string[] = [], language =
     const restoreCommand = commands.find(value => value.name === "tree-versioning-restore");
     assert.ok(restoreCommand, "The installed package must register its restoration command");
     assert.match(restoreCommand.description!, language === "en" ? /automatic file restoration/ : /自动恢复文件/);
+    const depthCommand = commands.find(value => value.name === "tree-versioning-repository-depth");
+    assert.ok(depthCommand, "The installed package must register its repository depth command");
+    assert.match(depthCommand.description!, language === "en" ? /repository search depth/ : /仓库搜索深度/);
     const before = await client.getEntries();
     assert.ok(before.entries.some(entry => entry.type === "custom" && entry.customType === "tree-versioning.baseline"));
+    assert.equal(await client.prompt("/tree-versioning-repository-depth 1"), "handled");
     assert.equal(await client.prompt("/tree-versioning-restore off"), "handled");
     assert.equal(await client.prompt("/tree-versioning-language zh-CN"), "handled");
     const localized = (await client.getCommands()).find(value => value.name === "tree-versioning-diff")!;
@@ -78,7 +82,7 @@ test("the local archive includes its explicit entry, both languages, license, an
   assert.equal(manifest.devDependencies["@earendil-works/pi-coding-agent"], "1.5.2");
   const preview = JSON.parse((await run("npm", ["pack", "--dry-run", "--json"])).stdout)[0];
   const paths: string[] = preview.files.map((file: { path: string }) => file.path);
-  for (const path of ["package.json", "src/index.ts", "src/preferences.ts", "src/locales/en.ts", "src/locales/zh-CN.ts", "README.md", "README.zh-CN.md", "LICENSE"]) {
+  for (const path of ["package.json", "src/index.ts", "src/preferences.ts", "src/repositories.ts", "src/locales/en.ts", "src/locales/zh-CN.ts", "README.md", "README.zh-CN.md", "LICENSE"]) {
     assert.ok(paths.includes(path), path);
   }
   for (const path of paths) {
@@ -136,9 +140,10 @@ async function verifyInstalledRuntime(installed: string) {
   const result = await run(process.execPath, ["--import", "./test/isolate.mjs", "--import", "tsx", "--test", "--test-concurrency=1",
     "test/checkpoints.test.ts", "test/restore.test.ts", "test/diff-views.test.ts", "test/inheritance-views.test.ts",
     "test/restore-preference.test.ts", "test/restore-toggle.test.ts", "test/restore-concurrency.test.ts",
-    "test/status.test.ts", "test/model-context.test.ts", "test/restart.test.ts"],
+    "test/status.test.ts", "test/model-context.test.ts", "test/restart.test.ts",
+    "test/nested-repositories.test.ts", "test/nested-discovery.test.ts", "test/nested-inheritance.test.ts", "test/nested-safety.test.ts", "test/nested-review.test.ts"],
   sourceRoot, { ...environment, TREE_VERSIONING_TEST_PACKAGE: installed });
-  return "Installed artifact: checkpoints, queries, restoration switch, status tool, persistence, diff UI, inherited bilingual cards\n" +
+  return "Installed artifact: checkpoints, queries, restoration switch, status tool, persistence, diff UI, inherited bilingual cards, nested repository coverage\n" +
     result.stdout.split("\n").filter(line => /^(?:ℹ|# (?:tests|pass|fail|skipped))/.test(line)).join("\n");
 }
 

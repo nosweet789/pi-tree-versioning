@@ -13,7 +13,7 @@ const diffCardSchema = Type.Union([comparisonOutput, Type.Object({
 })]);
 
 // Escape terminal instructions without changing the stored paths or patches.
-function terminalText(value: string, multiline = false): string {
+export function terminalText(value: string, multiline = false): string {
   const controls = multiline ? /[\x00-\x08\x0b-\x1f\x7f-\x9f]/g : /[\x00-\x1f\x7f-\x9f]/g;
   return value.replace(controls, character => "\\u" + character.charCodeAt(0).toString(16).padStart(4, "0"));
 }
@@ -100,6 +100,10 @@ export function diffView(value: unknown, language: Language, options: EntryRende
         theme.fg("muted", language.message("diffFrom", { endpoint: endpoint(comparison.from) })),
         theme.fg("muted", language.message("diffTo", { endpoint: endpoint(comparison.to) })),
       ];
+      const coverage = comparison.coverage ?? { searchDepth: 0, repositories: ["."] };
+      lines.push(theme.fg("muted", language.message("repositoryCoverage", {
+        depth: coverage.searchDepth, repositories: terminalText(JSON.stringify(coverage.repositories)),
+      })));
       if (comparison.files.length === 0) lines.push(language.message("noFileChanges"));
       const statuses: Record<string, { label: MessageKey; color: ThemeColor }> = {
         added: { label: "fileAdded", color: "toolDiffAdded" },
