@@ -3,11 +3,11 @@ import type { ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent"
 import { KeybindingsManager } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js";
 import { createChatViewport } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/chat-viewport.js";
 import {
-  Container, getKeybindings, setKeybindings, Text, TuiAltScreen, TuiMainScreen,
+  Container, getKeybindings, Input, setKeybindings, Text, TuiAltScreen, TuiMainScreen,
   type Component, type OverlayHandle, type Terminal,
 } from "@earendil-works/pi-tui";
 
-export function viewFixture(mode: "regular" | "fullscreen" = "regular", widgetRows = 0) {
+export function viewFixture(mode: "regular" | "fullscreen" = "regular", widgetRows = 0, belowRows = 0) {
   let input: (data: string) => void = () => {};
   let resize: () => void = () => {};
   const terminal: Terminal & { columns: number; rows: number } = {
@@ -28,16 +28,20 @@ export function viewFixture(mode: "regular" | "fullscreen" = "regular", widgetRo
     setKeybindings(keybindings);
     activeTui = tui;
     const editor = new Container();
-    editor.addChild(new Text("Editor", 0, 0));
+    const draft = new Input();
+    draft.setValue("Unsubmitted draft");
+    editor.addChild(draft);
     const document = new Text(Array.from({ length: 60 }, (_, index) => `Transcript ${index}`).join("\n"), 0, 0);
     const widgetsAbove = new Text(Array.from({ length: widgetRows }, () => "Extension widget").join("\n"), 0, 0);
+    const widgetsBelow = new Text(Array.from({ length: belowRows }, () => "Below editor widget").join("\n"), 0, 0);
     const footer = new Text("Footer", 0, 0);
+    // The host mounts the same ordered components in both renderers.
+    for (const child of [document, widgetsAbove, editor, widgetsBelow, footer]) tui.addChild(child);
     if (tui instanceof TuiAltScreen) {
       tui.setLayoutRoot(createChatViewport({ document, pendingMessages: new Container(), status: new Container(),
-        widgetsAbove, editor, footer, scrollbar: "hidden" }).root);
-    } else {
-      for (const child of [document, widgetsAbove, editor, footer]) tui.addChild(child);
+        widgetsAbove, editor, widgetsBelow, footer, scrollbar: "hidden" }).root);
     }
+    tui.setFocus(draft);
     let overlay: OverlayHandle | undefined;
     let component: (Component & { dispose?(): void }) | undefined;
     try {
@@ -48,8 +52,8 @@ export function viewFixture(mode: "regular" | "fullscreen" = "regular", widgetRo
           closed = true;
           overlay?.hide();
           editor.clear();
-          editor.addChild(new Text("Editor", 0, 0));
-          tui.setFocus(editor);
+          editor.addChild(draft);
+          tui.setFocus(draft);
           resolve(result);
         })).then(created => {
           component = created;
@@ -63,9 +67,15 @@ export function viewFixture(mode: "regular" | "fullscreen" = "regular", widgetRo
           }
           tui.renderNow();
           try { inspect(component); } catch (error) { inspectionError = error; }
-          input("\x1b");
-          assert.equal(closed, true, "Escape must close the read-only viewer");
-        }).catch(error => { inspectionError = error; reject(error); });
+          if (!closed) input("\x1b");
+          assert.equal(closed, true, "The configured cancel key must close the read-only viewer");
+          tui.renderNow();
+          assert.equal(draft.getValue(), "Unsubmitted draft");
+          assert.equal(draft.focused, true);
+          input("!");
+          assert.equal(draft.getValue(), "!Unsubmitted draft", "Typing must return to the original input");
+          assert.equal(tui.hasOverlay(), false);
+        }).catch(error => { inspectionError ??= error; reject(error); });
       });
     } finally {
       component?.dispose?.();
@@ -81,9 +91,11 @@ export function viewFixture(mode: "regular" | "fullscreen" = "regular", widgetRo
     verify() { if (inspectionError) throw inspectionError; },
     sendKey(data: string) { input(data); activeTui?.renderNow(); },
     resize(columns: number, rows: number) { terminal.columns = columns; terminal.rows = rows; resize(); activeTui?.renderNow(true); },
+    hasOverlay() { return activeTui?.hasOverlay() ?? false; },
     screenLines() {
-      assert.ok(activeTui instanceof TuiAltScreen, "Screen inspection requires the real fullscreen renderer");
-      return activeTui.getScreenLines();
+      assert.ok(activeTui, "Screen inspection requires an open viewer");
+      return activeTui instanceof TuiAltScreen ? activeTui.getScreenLines() :
+        activeTui.captureRenderState().previousLines.slice(-terminal.rows);
     },
   };
 }

@@ -49,7 +49,7 @@ For a persistent local installation, use `pi install /absolute/path/to/pi-tree-v
 
 On activation, the extension captures a **session baseline**, including existing uncommitted edits. Each complete processing round saves a checkpoint when pi settles and waits for input, including interruption and error stops. Steering, queued input, and automatic retries stay within the continuous round.
 
-Each checkpoint adds a card with changed files and addition/deletion counts. Use pi's **expand tool output** action, **Ctrl+O** by default, to inspect text patches. Binary files show change summaries. An unchanged round still gets a checkpoint and an empty-diff card.
+Each checkpoint adds a card with changed files and addition/deletion counts. Bold paths and themed diff colors distinguish the file summary, additions, deletions, and context; status text and `+`/`-` markers remain visible. Use pi's **expand tool output** action, **Ctrl+O** by default, to inspect text patches. Binary files show change summaries. An unchanged round still gets a checkpoint and an empty-diff card.
 
 To view the current branch's saved total diff:
 
@@ -58,6 +58,8 @@ To view the current branch's saved total diff:
 ```
 
 The read-only viewer compares the session baseline with the current branch's saved checkpoint. Later disk edits belong to the workspace comparison described below.
+
+The viewer opens in the bottom input area, like pi's `/tree` and `/resume`, and restores your input and focus when closed. Its panel uses at most half the terminal height, shrinking for short content or other widgets. Long diffs scroll inside the panel. Close help stays at the bottom; if the key guide is too wide, scroll to the start for the complete guide. If the terminal is too small or other widgets fill the input area, enlarge the window or reduce those widgets to see both content and controls.
 
 Default viewer keys are **Ctrl+O** to expand patches, **↑/↓** to scroll, **Page Up/Page Down** to move by page, and **Escape** to close. Your pi keybindings apply. Use `/tree-versioning-diff help` for help; in RPC, print, or JSON mode, query `session_diff` with `scope: "session"`.
 

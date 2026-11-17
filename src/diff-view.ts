@@ -1,5 +1,5 @@
-import type { EntryRenderOptions, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { ScrollView, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
+import type { EntryRenderOptions, ExtensionContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
+import { Container, ScrollView, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TUI } from "@earendil-works/pi-tui";
 import type { RecordedDiff, SessionFiles } from "./session-files.ts";
 import type { Language, MessageKey } from "./language.ts";
 import { errorCodes } from "./errors.ts";
@@ -18,6 +18,16 @@ function terminalText(value: string, multiline = false): string {
   return value.replace(controls, character => "\\u" + character.charCodeAt(0).toString(16).padStart(4, "0"));
 }
 
+function panelHeight(tui: TUI, viewer: Component, width: number): number {
+  const containsViewer = (component: Component): boolean => component === viewer ||
+    (component instanceof Container && component.children.some(containsViewer));
+  // Pi mounts the transcript first, followed by dock components, in both modes.
+  // Reserve their natural heights so fullscreen never clips our scrolling viewport.
+  const dockHeight = tui.children.slice(1).filter(component => !containsViewer(component))
+    .reduce((height, component) => height + component.render(width).length, 0);
+  return Math.max(0, Math.min(Math.floor(tui.terminal.rows / 2), Math.max(2, tui.terminal.rows - dockHeight - 1)));
+}
+
 export async function showDiff(comparison: Comparison, language: Language, ctx: ExtensionContext) {
   await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
     let expanded = false;
@@ -28,17 +38,26 @@ export async function showDiff(comparison: Comparison, language: Language, ctx: 
     };
     const content = diffView(comparison, language, options, theme);
     const scroll = new ScrollView(content, { scrollbar: "hidden", follow: "none" });
-    return {
+    const viewer: Component = {
+      capturesViewportInput: true,
       render(width) {
-        const lines = scroll.render(width);
-        const height = Math.max(1, tui.terminal.rows - 4);
-        scroll.updateLayout(lines.length, height, () => tui.requestRender());
+        const available = panelHeight(tui, viewer, width);
         const help = language.message("viewerKeys", {
           scroll: options.keyText("tui.select.up") + "/" + options.keyText("tui.select.down"),
           page: options.keyText("tui.select.pageUp") + "/" + options.keyText("tui.select.pageDown"),
           expand: options.keyText("app.tools.expand"), close: options.keyText("tui.select.cancel"),
         });
-        return [...lines.slice(scroll.scrollTop, scroll.scrollTop + height), truncateToWidth(theme.fg("dim", help), width)];
+        const helpLines = wrapTextWithAnsi(theme.fg("dim", help), width);
+        // Leave most of the panel for the diff. In cramped layouts, keep close help
+        // pinned and put the complete key guide at the start of the scrollable content.
+        const compactHelp = helpLines.length > Math.max(1, Math.floor(available / 3));
+        const closeHints = keybindings.getKeys("tui.select.cancel").map(close => language.message("viewerClose", { close }));
+        const closeHint = closeHints.find(hint => visibleWidth(hint) <= width) ?? closeHints[0] ?? "";
+        const footer = compactHelp ? [truncateToWidth(theme.fg("dim", closeHint), width)] : helpLines;
+        const lines = [...(compactHelp ? [...helpLines, ""] : []), ...scroll.render(width)];
+        const height = Math.max(0, available - footer.length);
+        scroll.updateLayout(lines.length, height, () => tui.requestRender());
+        return [...lines.slice(scroll.scrollTop, scroll.scrollTop + height), ...footer].slice(0, available);
       },
       handleInput(data) {
         if (keybindings.matches(data, "tui.select.cancel")) { done(); return; }
@@ -55,7 +74,8 @@ export async function showDiff(comparison: Comparison, language: Language, ctx: 
       },
       invalidate() { content.invalidate(); },
     };
-  }, { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", margin: { top: 1, bottom: 1 } } });
+    return viewer;
+  });
 }
 
 export function diffView(value: unknown, language: Language, options: EntryRenderOptions, theme: Theme): Component {
@@ -75,18 +95,38 @@ export function diffView(value: unknown, language: Language, options: EntryRende
       const endpoint = (value: Comparison["to"]) => value.kind === "workspace" ? terminalText(value.workspaceRoot) :
         language.message(value.kind) + " " + terminalText(value.id) + (value.kind === "checkpoint" ? " · " + terminalText(value.nodeId) : "");
       const lines = [
-        theme.fg("accent", language.message(comparison.scope === "session" ? "sessionDiff" : "roundDiff")),
-        language.message("diffFrom", { endpoint: endpoint(comparison.from) }),
-        language.message("diffTo", { endpoint: endpoint(comparison.to) }),
+        theme.fg("accent", theme.bold(language.message(comparison.scope === "session" ? "sessionDiff" : "roundDiff"))),
+        theme.fg("border", "─".repeat(Math.max(0, width))),
+        theme.fg("muted", language.message("diffFrom", { endpoint: endpoint(comparison.from) })),
+        theme.fg("muted", language.message("diffTo", { endpoint: endpoint(comparison.to) })),
       ];
       if (comparison.files.length === 0) lines.push(language.message("noFileChanges"));
-      const statuses: Record<string, MessageKey> = { added: "fileAdded", deleted: "fileDeleted", modified: "fileModified", type_changed: "fileTypeChanged" };
+      const statuses: Record<string, { label: MessageKey; color: ThemeColor }> = {
+        added: { label: "fileAdded", color: "toolDiffAdded" },
+        deleted: { label: "fileDeleted", color: "toolDiffRemoved" },
+        modified: { label: "fileModified", color: "warning" },
+        type_changed: { label: "fileTypeChanged", color: "warning" },
+      } as const;
       for (const file of comparison.files) {
-        lines.push(terminalText(file.path) + " · " + (file.binary ? language.message("binaryFile") + " · " : "") +
-          language.message(statuses[file.status]) + (file.binary ? "" : ` · +${file.additions} -${file.deletions}`));
-        if (options.expanded && file.patch) lines.push(terminalText(file.patch, true));
+        const status = statuses[file.status];
+        lines.push(theme.bold(terminalText(file.path)) + " · " + (file.binary ? theme.fg("muted", language.message("binaryFile")) + " · " : "") +
+          theme.fg(status.color, language.message(status.label)) + (file.binary ? "" : " · " +
+            theme.fg("toolDiffAdded", `+${file.additions}`) + " " + theme.fg("toolDiffRemoved", `-${file.deletions}`)));
+        if (options.expanded && file.patch) {
+          let inHunk = false;
+          for (const line of terminalText(file.patch, true).replace(/\n$/, "").split("\n")) {
+            if (line.startsWith("@@")) {
+              inHunk = true;
+              lines.push(theme.fg("accent", line));
+            } else {
+              const color = !inHunk ? "muted" : line.startsWith("+") ? "toolDiffAdded" :
+                line.startsWith("-") ? "toolDiffRemoved" : line.startsWith(" ") ? "toolDiffContext" : "dim";
+              lines.push(theme.fg(color, line));
+            }
+          }
+        }
       }
-      if (!options.expanded && comparison.files.some(file => file.patch)) lines.push(options.keyHint("app.tools.expand", language.message("expandDiff")));
+      if (!options.expanded && comparison.files.some(file => file.patch)) lines.push(theme.fg("dim", options.keyHint("app.tools.expand", language.message("expandDiff"))));
       text.setText(lines.join("\n"));
       return text.render(width);
     },

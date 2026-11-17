@@ -331,6 +331,71 @@ function rendered(app: TestApp, entry: CustomEntry, expanded = false, width = 12
   return cardComponent(app, entry, expanded).render(width).map(line => stripVTControlCharacters(line).trimEnd()).join("\n");
 }
 
+test("expanded diffs distinguish changes, context, and metadata without mistaking patch content for headers", async () => {
+  const workspace = await fixture();
+  await writeFile(join(workspace.cwd, "notes.txt"), "context\n-- removed\nlast\n");
+  const view = viewFixture();
+  const app = await load(workspace, undefined, { mode: "tui", custom: view.custom });
+  const theme = app.session.extensionRunner.getUIContext().theme;
+  view.setTheme(theme);
+  try {
+    await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
+    await writeFile(join(workspace.cwd, "notes.txt"), "context\n++ added\nlast\n");
+    await app.session.prompt("Record patch lines resembling headers.");
+    const checkPatch = (lines: string[]) => {
+      const output = lines.join("\n");
+      assert.ok(output.includes(theme.fg("toolDiffRemoved", "--- removed")), "Removed content is not a file header");
+      assert.ok(output.includes(theme.fg("toolDiffAdded", "+++ added")), "Added content is not a file header");
+      assert.ok(output.includes(theme.fg("toolDiffContext", " context")));
+      assert.ok(output.includes(theme.fg("muted", "--- a/notes.txt")));
+      assert.ok(output.includes(theme.fg("accent", "@@ -1,3 +1,3 @@")));
+      assert.ok(output.includes(theme.fg("warning", "Modified")));
+      assert.match(stripVTControlCharacters(output), / context\s*\n--- removed\s*\n\+\+\+ added\s*\n last/);
+    };
+    checkPatch(cardComponent(app, cards(app)[0], true).render(120));
+    view.inspect(component => {
+      view.sendKey("\x0f");
+      checkPatch(component.render(120));
+    });
+    await app.session.prompt("/tree-versioning-diff");
+    view.verify();
+  } finally { dispose(app.session); }
+});
+
+test("cards and the session viewer emphasize paths and statistics using the active theme", async () => {
+  const workspace = await fixture();
+  const view = viewFixture();
+  const app = await load(workspace, undefined, { mode: "tui", custom: view.custom });
+  const theme = app.session.extensionRunner.getUIContext().theme;
+  view.setTheme(theme);
+  try {
+    await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
+    await writeFile(join(workspace.cwd, "notes.txt"), "saved text\n");
+    await app.session.prompt("Record a styled diff.");
+    const checkSummary = (lines: string[], title: string) => {
+      const output = lines.join("\n");
+      assert.ok(output.includes(theme.bold(title)), "The title must be bold");
+      assert.ok(output.includes(theme.bold("notes.txt")), "Paths must stand out from metadata");
+      assert.ok(output.includes(theme.fg("toolDiffAdded", "+1")));
+      assert.ok(output.includes(theme.fg("toolDiffRemoved", "-1")));
+      assert.ok(lines.some(line => /^─{3,}\s*$/.test(stripVTControlCharacters(line))), "Separate the diff from ordinary text");
+      assert.ok(lines.some(line => line.includes(theme.fg("muted", stripVTControlCharacters(line).trimEnd())) &&
+        /From:|起点：/.test(stripVTControlCharacters(line))), "Endpoints must have secondary emphasis");
+      assert.doesNotMatch(stripVTControlCharacters(output), /saved text|@@/);
+    };
+    for (const palette of ["dark", "light"]) {
+      initTheme(palette, false);
+      for (const locale of ["en", "zh-CN"]) {
+        await app.command(locale);
+        checkSummary(cardComponent(app, cards(app)[0]).render(120), locale === "en" ? "Round diff" : "轮次差异");
+        view.inspect(component => checkSummary(component.render(120), locale === "en" ? "Saved session diff" : "已保存的会话总差异"));
+        await app.session.prompt("/tree-versioning-diff");
+        view.verify();
+      }
+    }
+  } finally { initTheme("dark", false); dispose(app.session); }
+});
+
 test("a recorded round displays persistent endpoints, file statistics, binary summaries, and expandable text", async () => {
   const workspace = await fixture();
   await writeFile(join(workspace.cwd, "removed.txt"), "remove me\n");
