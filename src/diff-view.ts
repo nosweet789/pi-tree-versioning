@@ -1,11 +1,13 @@
 import type { EntryRenderOptions, ExtensionContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
-import { Container, ScrollView, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TUI } from "@earendil-works/pi-tui";
+import { Container, ScrollView, Text, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TUI } from "@earendil-works/pi-tui";
 import type { RecordedDiff, SessionFiles } from "./session-files.ts";
 import type { Language, MessageKey } from "./language.ts";
 import { errorCodes } from "./errors.ts";
 import { comparisonOutput } from "./tool-contract.ts";
 import { Type } from "typebox";
 import { Check } from "typebox/value";
+import { formatPatch } from "diff";
+import { createInlineDiffer, type InlineSpan } from "./inline-diff.ts";
 
 type Comparison = Awaited<ReturnType<SessionFiles["diff"]>>;
 const diffCardSchema = Type.Union([comparisonOutput, Type.Object({
@@ -16,6 +18,208 @@ const diffCardSchema = Type.Union([comparisonOutput, Type.Object({
 export function terminalText(value: string, multiline = false): string {
   const controls = multiline ? /[\x00-\x08\x0b-\x1f\x7f-\x9f]/g : /[\x00-\x1f\x7f-\x9f]/g;
   return value.replace(controls, character => "\\u" + character.charCodeAt(0).toString(16).padStart(4, "0"));
+}
+
+type InlineDiffer = ReturnType<typeof createInlineDiffer>;
+const inlineDiffs = new WeakMap<Comparison, InlineDiffer>();
+
+function inlineDiffer(comparison: Comparison): InlineDiffer {
+  // Pi can recreate a card component on invalidation. Keep only unstyled diffs
+  // with the recorded comparison so the budget and results survive that rebuild.
+  let differ = inlineDiffs.get(comparison);
+  if (!differ) {
+    differ = createInlineDiffer();
+    inlineDiffs.set(comparison, differ);
+  }
+  return differ;
+}
+
+const patchGraphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+function keepsHighlightedSpace(wrapped: string[], plain: string, display: InlineSpan[]) {
+  const spaces: number[] = [];
+  let offset = 0;
+  for (const span of display) {
+    if (span.changed) {
+      for (const match of span.text.matchAll(/\s/gu)) spaces.push(offset + match.index);
+    }
+    offset += span.text.length;
+  }
+  const rows = wrapped.map(stripTerminalSequences).filter(Boolean);
+  const latestStarts: number[] = [];
+  let limit = plain.length;
+  for (let index = rows.length - 1; index >= 0; index--) {
+    const text = rows[index];
+    if (limit < text.length) return false;
+    limit = plain.lastIndexOf(text, limit - text.length);
+    if (limit < 0) return false;
+    latestStarts[index] = limit;
+  }
+  // Repeated spaces can match either side of a wrap. Only count positions
+  // retained under both alignments, in the same row.
+  let space = 0, earliestEnd = 0;
+  for (const [index, text] of rows.entries()) {
+    const start = plain.indexOf(text, earliestEnd);
+    if (start < 0 || spaces[space] < latestStarts[index]) return false;
+    earliestEnd = start + text.length;
+    while (spaces[space] < earliestEnd) space++;
+  }
+  return space === spaces.length;
+}
+
+function escapeGlyph(glyph: string, keepSign = false): string {
+  const start = keepSign ? glyph[0] : "";
+  const escaped = Array.from(glyph.slice(start.length), character => `\\u{${character.codePointAt(0)!.toString(16)}}`).join("");
+  return start + escaped;
+}
+
+function patchDisplayText(text: string): string {
+  return terminalText(text, true).replace(/\t/g, "   ");
+}
+
+function fitPatchText(line: string, width: number): string {
+  const text = patchDisplayText(line);
+  if (!/[^\x20-\x7e]/u.test(text) || visibleWidth(text) <= width) return text;
+  let fitted = "";
+  for (const { segment, index } of patchGraphemes.segment(text)) {
+    const keepSign = index === 0 && (segment[0] === "+" || segment[0] === "-");
+    fitted += visibleWidth(segment) > width ? escapeGlyph(segment, keepSign) : segment;
+  }
+  return fitted;
+}
+
+function cutsDisplayGlyph(spans: InlineSpan[], plain: string): boolean {
+  const glyphs = patchGraphemes.segment(plain);
+  let offset = 0;
+  for (const span of spans) {
+    if (glyphs.containing(offset)?.index !== offset) return true;
+    offset += span.text.length;
+  }
+  return false;
+}
+
+function renderChangedLine(sign: string, spans: InlineSpan[], color: ThemeColor, theme: Theme, width: number): string[] {
+  const display = [{ text: sign, changed: false }, ...spans.map(span => ({
+    text: patchDisplayText(span.text), changed: span.changed,
+  }))];
+  const plain = display.map(span => span.text).join("");
+  const render = (parts: InlineSpan[]) => parts.map(({ text, changed }) =>
+    theme.style(text, { fg: color, bold: changed, underline: changed })).join("");
+  const styled = render(display);
+  const highlightedSpace = display.some(span => span.changed && /\s/u.test(span.text));
+  const nonAscii = /[^\x20-\x7e]/u.test(plain);
+  // Escaped controls, expanded tabs, or the line prefix can join adjoining
+  // characters into a new grapheme. Wrap it as a whole without moving its styles.
+  const splitGlyph = nonAscii && cutsDisplayGlyph(display, plain);
+  if (!splitGlyph) {
+    if ((!highlightedSpace && !nonAscii) || visibleWidth(plain) <= width) return [styled];
+    const wrapped = wrapTextWithAnsi(styled, width);
+    if (wrapped.every(line => visibleWidth(line) <= width) &&
+        (!highlightedSpace || keepsHighlightedSpace(wrapped, plain, display))) return [styled];
+  }
+
+  // Keep Pi's word wrapping where possible. The fallback measures complete glyphs
+  // and carries their style to the next row, including right at a column break.
+  const rows: string[] = [];
+  let row: InlineSpan[] = [], columns = 0;
+  const nextRow = () => {
+    rows.push(render(row));
+    row = [];
+    columns = 0;
+  };
+  const append = (text: string, changed: boolean) => {
+    const previous = row.at(-1);
+    if (previous?.changed === changed) previous.text += text;
+    else row.push({ text, changed });
+  };
+  let spanIndex = 0, spanEnd = display[0].text.length;
+  for (const { segment, index } of patchGraphemes.segment(plain)) {
+    const cells = visibleWidth(segment), end = index + segment.length;
+    if (cells <= width && columns + cells > width) nextRow();
+    for (let offset = index; offset < end;) {
+      const { changed } = display[spanIndex];
+      const limit = Math.min(spanEnd, end);
+      const part = plain.slice(offset, limit);
+      if (cells <= width) append(part, changed);
+      else {
+        // An indivisible glyph cannot fit here. Escape its text, not the diff sign.
+        for (const character of escapeGlyph(part, offset === 0)) {
+          if (columns === width) nextRow();
+          append(character, changed);
+          columns++;
+        }
+      }
+      offset = limit;
+      if (offset === spanEnd && spanIndex + 1 < display.length) spanEnd += display[++spanIndex].text.length;
+    }
+    if (cells <= width) columns += cells;
+  }
+  if (row.length) nextRow();
+  return rows;
+}
+
+function changeColor(line: string) {
+  return line[0] === "-" ? "toolDiffRemoved" : line[0] === "+" ? "toolDiffAdded" : undefined;
+}
+
+function* renderPatch(patch: string, path: string, theme: Theme, width: number, inlineDiff: InlineDiffer) {
+  // formatPatch writes literal filenames, which can contain line breaks and hunk-like text.
+  const header = formatPatch({ oldFileName: "a/" + path, newFileName: "b/" + path,
+    oldHeader: undefined, newHeader: undefined, hunks: [] });
+  const paint = (line: string, color: ThemeColor) => theme.fg(color, fitPatchText(line, width));
+  const hasKnownHeader = patch.startsWith(header);
+  for (const line of (hasKnownHeader ? header : patch).replace(/\n$/, "").split("\n")) {
+    yield paint(line, "muted");
+  }
+  if (!hasKnownHeader || patch.length === header.length) return;
+
+  const source = patch.slice(header.length).replace(/\n$/, "").split("\n");
+  let inHunk = false;
+  for (let start = 0; start < source.length;) {
+    const line = source[start];
+    if (line.startsWith("@@")) {
+      inHunk = /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(?: .*)?$/.test(line);
+      yield paint(line, inHunk ? "accent" : "muted");
+      start++;
+      continue;
+    }
+    const firstColor = inHunk ? changeColor(line) : undefined;
+    if (!firstColor) {
+      const color = !inHunk ? "muted" : line.startsWith(" ") ? "toolDiffContext" : "dim";
+      yield paint(line, color);
+      start++;
+      continue;
+    }
+    let end = start + 1, secondChange = -1;
+    let secondColor: ThemeColor | undefined, overflowColor: ThemeColor | undefined;
+    for (; end < source.length; end++) {
+      const row = source[end], color = changeColor(row);
+      if (color) {
+        if (secondColor) { overflowColor = color; break; }
+        secondChange = end;
+        secondColor = color;
+      } else if (row !== "\\ No newline at end of file") break;
+    }
+    const pair = !overflowColor && firstColor === "toolDiffRemoved" && secondColor === "toolDiffAdded"
+      ? inlineDiff(line.slice(1), source[secondChange].slice(1)) : undefined;
+    for (let index = start; index < end; index++) {
+      const row = source[index];
+      const color = index === start ? firstColor : index === secondChange ? secondColor ?? "dim" : "dim";
+      const spans = index === start ? pair?.removed : index === secondChange ? pair?.added : undefined;
+      if (spans) yield* renderChangedLine(row[0], spans, color, theme, width);
+      else yield paint(row, color);
+    }
+    // Once a third change rules out a pair, color the rest without buffering it.
+    if (overflowColor) {
+      yield paint(source[end++], overflowColor);
+      for (; end < source.length; end++) {
+        const row = source[end], color = changeColor(row);
+        if (!color && row !== "\\ No newline at end of file") break;
+        yield paint(row, color ?? "dim");
+      }
+    }
+    start = end;
+  }
 }
 
 function panelHeight(tui: TUI, viewer: Component, width: number): number {
@@ -81,8 +285,10 @@ export async function showDiff(comparison: Comparison, language: Language, ctx: 
 export function diffView(value: unknown, language: Language, options: EntryRenderOptions, theme: Theme): Component {
   const comparison = Check(diffCardSchema, value) ? value as RecordedDiff : undefined;
   const text = new Text("", 0, 0);
+  let patchLayout: { width: number; files: Map<string, string> } | undefined;
   return {
     render(width) {
+      if (width < 1) return [];
       if (!comparison) {
         text.setText(theme.fg("error", language.message("displayUnavailable")));
         return text.render(width);
@@ -105,6 +311,7 @@ export function diffView(value: unknown, language: Language, options: EntryRende
         depth: coverage.searchDepth, repositories: terminalText(JSON.stringify(coverage.repositories)),
       })));
       if (comparison.files.length === 0) lines.push(language.message("noFileChanges"));
+      const inlineDiff = options.expanded ? inlineDiffer(comparison) : undefined;
       const statuses: Record<string, { label: MessageKey; color: ThemeColor }> = {
         added: { label: "fileAdded", color: "toolDiffAdded" },
         deleted: { label: "fileDeleted", color: "toolDiffRemoved" },
@@ -116,24 +323,20 @@ export function diffView(value: unknown, language: Language, options: EntryRende
         lines.push(theme.bold(terminalText(file.path)) + " · " + (file.binary ? theme.fg("muted", language.message("binaryFile")) + " · " : "") +
           theme.fg(status.color, language.message(status.label)) + (file.binary ? "" : " · " +
             theme.fg("toolDiffAdded", `+${file.additions}`) + " " + theme.fg("toolDiffRemoved", `-${file.deletions}`)));
-        if (options.expanded && file.patch) {
-          let inHunk = false;
-          for (const line of terminalText(file.patch, true).replace(/\n$/, "").split("\n")) {
-            if (line.startsWith("@@")) {
-              inHunk = true;
-              lines.push(theme.fg("accent", line));
-            } else {
-              const color = !inHunk ? "muted" : line.startsWith("+") ? "toolDiffAdded" :
-                line.startsWith("-") ? "toolDiffRemoved" : line.startsWith(" ") ? "toolDiffContext" : "dim";
-              lines.push(theme.fg(color, line));
-            }
+        if (inlineDiff && file.patch) {
+          if (patchLayout?.width !== width) patchLayout = { width, files: new Map() };
+          let rendered = patchLayout.files.get(file.path);
+          if (rendered === undefined) {
+            rendered = [...renderPatch(file.patch, file.path, theme, width, inlineDiff)].join("\n");
+            patchLayout.files.set(file.path, rendered);
           }
+          lines.push(rendered);
         }
       }
-      if (!options.expanded && comparison.files.some(file => file.patch)) lines.push(theme.fg("dim", options.keyHint("app.tools.expand", language.message("expandDiff"))));
+      if (!inlineDiff && comparison.files.some(file => file.patch)) lines.push(theme.fg("dim", options.keyHint("app.tools.expand", language.message("expandDiff"))));
       text.setText(lines.join("\n"));
       return text.render(width);
     },
-    invalidate() { text.invalidate(); },
+    invalidate() { patchLayout = undefined; text.invalidate(); },
   };
 }

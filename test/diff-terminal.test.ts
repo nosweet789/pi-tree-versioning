@@ -8,6 +8,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { dispose, fixture, load } from "./harness.ts";
 import { responseStream, useModel } from "./agent-fixture.ts";
 import { viewFixture } from "./view-fixture.ts";
+import { assertStyledCharacters, styledCharacters } from "./terminal-style.ts";
 
 initTheme("dark", false);
 
@@ -38,6 +39,130 @@ for (const mode of ["regular", "fullscreen"] as const) for (const changed of [fa
       view.verify();
       assert.deepEqual(app.errors, []);
     } finally { dispose(app.session); }
+  });
+}
+
+test("a wrapped patch preserves one-sided spaces and expanded tabs at the column break", async () => {
+  const workspace = await fixture();
+  const path = join(workspace.cwd, "notes.txt");
+  const prefix = "甲".repeat(6) + "x";
+  const other = "乙".repeat(6) + "y";
+  await writeFile(path, `${prefix}尾\ncontext\n${other}\t末\n`);
+  const view = viewFixture("fullscreen");
+  view.terminal.columns = 14;
+  view.terminal.rows = 160;
+  const app = await load(workspace, undefined, { mode: "tui", custom: view.custom });
+  const theme = app.session.extensionRunner.getUIContext().theme;
+  view.setTheme(theme);
+  try {
+    await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
+    await writeFile(path, `${prefix} 尾\ncontext\n${other}末\n`);
+    await app.session.prompt("Insert a space and delete an expanded tab at the wrapping boundary.");
+    view.inspect(() => {
+      view.sendKey("\x0f");
+      const screen = view.screenLines();
+      assert.ok(screen.every(line => visibleWidth(line) <= 14));
+      for (const [sign, head, space, tail, color] of [
+        ["+", prefix, " ", "尾", "toolDiffAdded"], ["-", other, "   ", "末", "toolDiffRemoved"],
+      ] as const) {
+        const start = screen.findIndex(line => stripVTControlCharacters(line) === sign + head);
+        assert.ok(start >= 0, `Missing wrapped change: ${sign}${head}`);
+        const continuation = styledCharacters(screen[start + 1]);
+        const last = continuation.findIndex(({ text }) => text === tail);
+        assertStyledCharacters(continuation.slice(0, last + 1), theme, color, [space], tail);
+      }
+    });
+    await app.session.prompt("/tree-versioning-diff");
+    view.verify();
+  } finally { dispose(app.session); }
+});
+
+test("highlighted Unicode whitespace survives wrapping without reflowing words when it fits", async () => {
+  const workspace = await fixture();
+  const path = join(workspace.cwd, "notes.txt");
+  const prefix = "甲".repeat(6);
+  await writeFile(path, `${prefix}尾\ncontext\nabcdefgh abcdefgh abcdefgh\ncontext\nabcdefghijkl\u00a0 \n`);
+  const view = viewFixture();
+  view.terminal.columns = 14;
+  view.terminal.rows = 160;
+  const app = await load(workspace, undefined, { mode: "tui", custom: view.custom });
+  const theme = app.session.extensionRunner.getUIContext().theme;
+  view.setTheme(theme);
+  try {
+    await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
+    await writeFile(path, `${prefix}\u00a0尾\ncontext\nabcdefgh abcdefgh abcdefgh \ncontext\nabcdefghijkl \u00a0 \n`);
+    await app.session.prompt("Insert a nonbreaking space and add trailing whitespace to a long line.");
+    view.inspect(() => {
+      view.sendKey("\x0f");
+      const screen = view.screenLines();
+      assert.ok(screen.every(line => visibleWidth(line) <= 14));
+      const characters = screen.flatMap(styledCharacters);
+      const space = characters.find(character => character.text === "\u00a0");
+      assert.ok(space?.bold && space.underline, "The Unicode whitespace itself must be emphasized");
+      const start = screen.findIndex(line => stripVTControlCharacters(line).trimEnd() === "+abcdefgh");
+      assert.ok(start >= 0, "The first word should stay whole");
+      assert.equal(stripVTControlCharacters(screen[start + 1]).trimEnd(), "abcdefgh");
+      assertStyledCharacters(styledCharacters(screen[start + 2]).slice(0, 9), theme, "toolDiffAdded", "abcdefgh", [" "]);
+
+      const repeatedSpace = screen.find(line => stripVTControlCharacters(line).startsWith("+abcdefghijkl"));
+      assert.ok(repeatedSpace);
+      assertStyledCharacters(styledCharacters(repeatedSpace), theme, "toolDiffAdded", "+abcdefghijkl", [" "]);
+    });
+    await app.session.prompt("/tree-versioning-diff");
+    view.verify();
+  } finally { dispose(app.session); }
+});
+
+for (const [mode, palette] of [["regular", "dark"], ["fullscreen", "light"]] as const) {
+  test(`${mode} keeps inline emphasis on the right characters after wrapping in the ${palette} theme`, async () => {
+    const workspace = await fixture();
+    const path = join(workspace.cwd, "notes.txt");
+    const oldValue = "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥👩‍💻e\u0301";
+    const newValue = "春夏秋冬东西南北红黄蓝绿上下左右山川江海昼夜👩‍🔬e\u0300";
+    await writeFile(path, `值=${oldValue};尾\n`);
+    const view = viewFixture(mode);
+    view.terminal.columns = 80;
+    view.terminal.rows = 96;
+    initTheme(palette, false);
+    const app = await load(workspace, undefined, { mode: "tui", custom: view.custom });
+    const theme = app.session.extensionRunner.getUIContext().theme;
+    view.setTheme(theme);
+    try {
+      await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
+      await writeFile(path, `值=${newValue};尾\n`);
+      await app.session.prompt("Change a long value containing wide and combined characters.");
+      view.inspect(() => {
+        assert.ok(view.screenLines().every(line => !stripVTControlCharacters(line).includes("值=")));
+        view.sendKey("\x0f");
+        for (const width of [80, 14]) {
+          view.resize(width, 96);
+          const seen = new Set<string>();
+          for (let scroll = 0; scroll < 80 && seen.size < 2; scroll++) {
+            const screen = view.screenLines();
+            const plain = screen.map(line => stripVTControlCharacters(line).trimEnd());
+            assert.ok(screen.every(line => visibleWidth(line) <= width));
+            for (const [sign, value, color] of [["-", oldValue, "toolDiffRemoved"], ["+", newValue, "toolDiffAdded"]] as const) {
+              if (seen.has(sign)) continue;
+              const start = plain.findIndex(line => line.startsWith(`${sign}值=`));
+              const end = plain.findIndex((line, index) => index >= start && line.endsWith(";尾"));
+              if (start < 0 || end < start) continue;
+              if (width === 14) assert.ok(end > start, "The changed fragment must wrap across several terminal rows");
+              const characters = screen.slice(start, end + 1).flatMap(line => {
+                const length = Array.from(stripVTControlCharacters(line).trimEnd()).length;
+                return styledCharacters(line).slice(0, length);
+              });
+              assertStyledCharacters(characters, theme, color, `${sign}值=`, [value], ";尾");
+              seen.add(sign);
+            }
+            if (seen.size < 2) view.sendKey("\x1b[B");
+          }
+          assert.equal(seen.size, 2, "Both styled patch lines must be reachable through the viewer");
+        }
+      });
+      await app.session.prompt("/tree-versioning-diff");
+      view.verify();
+      assert.deepEqual(app.errors, []);
+    } finally { initTheme("dark", false); dispose(app.session); }
   });
 }
 
