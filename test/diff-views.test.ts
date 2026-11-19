@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
@@ -12,6 +12,47 @@ import { assertStyledCharacters, styledCharacters } from "./terminal-style.ts";
 import { responseStream, useModel, type TestApp } from "./agent-fixture.ts";
 
 initTheme("dark", false);
+
+test("round cards summarize net file changes before the file list in both display modes", async () => {
+  const workspace = await fixture();
+  const workspacePath = (name: string) => join(workspace.cwd, name);
+  await writeFile(workspacePath("reverted.txt"), "original content\n");
+  await writeFile(workspacePath("deleted.txt"), "to be deleted\n");
+  await writeFile(workspacePath("kind.txt"), "regular file\n");
+  const app = await load(workspace);
+  try {
+    await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
+    await writeFile(workspacePath("earlier.txt"), "saved in the first round\n");
+    await app.session.prompt("Record the preceding round.");
+
+    app.session.agent.streamFunction = async () => {
+      await writeFile(workspacePath("notes.txt"), "intermediate content\n");
+      await writeFile(workspacePath("reverted.txt"), "temporary change\n");
+      await writeFile(workspacePath("notes.txt"), "final content\n");
+      await writeFile(workspacePath("reverted.txt"), "original content\n");
+      await rm(workspacePath("kind.txt"));
+      await symlink("notes.txt", workspacePath("kind.txt"));
+      await rm(workspacePath("deleted.txt"));
+      await writeFile(workspacePath("added-a.txt"), "first addition\n");
+      await writeFile(workspacePath("added-b.txt"), "second addition\n");
+      return responseStream({ content: [{ type: "text", text: "Done." }] });
+    };
+    await app.session.prompt("Record a mixed round.");
+    const round = cards(app)[1];
+    await writeFile(workspacePath("unsnapshotted.txt"), "only on disk\n");
+
+    for (const expanded of [false, true]) {
+      const card = rendered(app, round, expanded);
+      assert.match(card, /^Round diff\n[^\n]+\nFrom: Checkpoint [^\n]+\nTo: Checkpoint [^\n]+\nSession search depth: /);
+      assert.match(card, /^Session search depth: .+\n5 files changed: 2 modified, 2 added, 1 deleted\.\nadded-a\.txt · Added/m);
+      assert.match(card, /^kind\.txt · (Binary · )?Type changed/m);
+      assert.doesNotMatch(card, /No file changes|earlier\.txt|reverted\.txt|unsnapshotted\.txt|intermediate content/);
+      assert.equal(/^@@ /m.test(card), expanded);
+    }
+    await app.command("zh-CN");
+    assert.match(rendered(app, round), /覆盖仓库[^\n]+\n5 个文件有变化：修改 2 个、新增 2 个、删除 1 个。\nadded-a\.txt · 新增/);
+  } finally { dispose(app.session); }
+});
 
 test("the read-only session viewer compares the baseline to the current branch without capturing disk edits", async () => {
   const workspace = await fixture();
@@ -41,7 +82,7 @@ test("the read-only session viewer compares the baseline to the current branch w
       assert.ok(summary.includes(baseline.id));
       assert.ok(summary.includes(common.id));
       assert.match(summary, /notes.txt.*\+1.*-1/);
-      assert.doesNotMatch(summary, /abandoned.txt|unsnapshotted edit/);
+      assert.doesNotMatch(summary, /files? changed:|abandoned.txt|unsnapshotted edit/);
       component.handleInput?.("\x0f");
       const expanded = component.render(120).map(line => stripVTControlCharacters(line).trimEnd()).join("\n");
       assert.match(expanded, /-existing edit\n\+common edit/);
@@ -72,9 +113,9 @@ test("the same historical card changes language in place and after reload or reo
     const entries = app.manager.getEntries();
     const renderer = app.session.extensionRunner.getEntryRenderer(entry.customType)!;
     const mounted = new CustomEntryComponent(entry, renderer);
-    assert.match(mounted.render(120).map(stripVTControlCharacters).join("\n"), /Round diff/);
+    assert.match(mounted.render(120).map(stripVTControlCharacters).join("\n"), /Round diff[\s\S]*\n\s*1 file changed: 1 added\./);
     await app.command("zh-CN");
-    assert.match(mounted.render(120).map(stripVTControlCharacters).join("\n"), /轮次差异/);
+    assert.match(mounted.render(120).map(stripVTControlCharacters).join("\n"), /轮次差异[\s\S]*\n\s*1 个文件有变化：新增 1 个。/);
     assert.match(app.session.extensionRunner.getCommand("tree-versioning-diff")!.description!, /会话总差异/);
     await app.session.prompt("/tree-versioning-diff help");
     assert.match(app.notices.at(-1)!.message, /用法.*会话基线/);
@@ -83,17 +124,17 @@ test("the same historical card changes language in place and after reload or reo
     assert.deepEqual((await app.diff({ scope: "turn" })).details, comparison);
     assert.deepEqual(app.manager.getEntries(), entries);
     await app.session.reload();
-    assert.match(rendered(app, cards(app)[0]), /轮次差异/);
+    assert.match(rendered(app, cards(app)[0]), /^1 个文件有变化：新增 1 个。$/m);
     assert.deepEqual(app.manager.getEntries(), entries);
     assert.deepEqual((await app.diff({ scope: "turn" })).details, comparison);
     const sessionFile = app.manager.getSessionFile()!;
     dispose(app.session);
     reopened = await load(workspace, SessionManager.open(sessionFile));
-    assert.match(rendered(reopened, cards(reopened)[0]), /轮次差异/);
+    assert.match(rendered(reopened, cards(reopened)[0]), /^1 个文件有变化：新增 1 个。$/m);
     assert.deepEqual(reopened.manager.getEntries(), entries);
     assert.deepEqual((await reopened.diff({ scope: "turn" })).details, comparison);
     await reopened.command("en");
-    assert.match(rendered(reopened, cards(reopened)[0]), /Round diff/);
+    assert.match(rendered(reopened, cards(reopened)[0]), /^1 file changed: 1 added\.$/m);
     assert.deepEqual(reopened.manager.getEntries(), entries);
   } finally { dispose(app.session, ...(reopened ? [reopened.session] : [])); }
 });
@@ -115,9 +156,18 @@ test("an unchanged round and a baseline-only session explicitly display an empty
     await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
     await app.session.prompt("An unchanged round.");
     assert.equal(cards(app).length, 1);
-    assert.match(rendered(app, cards(app)[0]), /No file changes/);
-    await app.command("zh-CN");
-    assert.match(rendered(app, cards(app)[0]), /没有文件变化/);
+    const card = cards(app)[0];
+    for (const [locale, expected] of [
+      ["en", /Session search depth: [^\n]+\nNo file changes\.$/],
+      ["zh-CN", /会话搜索深度：[^\n]+\n没有文件变化。$/],
+    ] as const) {
+      await app.command(locale);
+      for (const expanded of [false, true]) {
+        const text = rendered(app, card, expanded);
+        assert.match(text, expected);
+        assert.doesNotMatch(text, /files? changed:|个文件有变化/);
+      }
+    }
   } finally { dispose(app.session); }
 });
 
@@ -152,7 +202,7 @@ test("missing predecessor history produces a durable error card rather than an e
     const failed = cards(app)[1];
     assert.match(rendered(app, failed), /checkpoint was recorded.*diff is unavailable/);
     assert.match(rendered(app, failed), /missing, unreadable, or corrupt/);
-    assert.doesNotMatch(rendered(app, failed), /No file changes|round was not recorded/);
+    assert.doesNotMatch(rendered(app, failed), /No file changes|files? changed:|round was not recorded/);
     assert.doesNotMatch(app.notices.at(-1)!.message, /round was not recorded/);
     assert.equal(((await app.diff({ scope: "session" })).details as any).status, "ok");
     assert.notEqual(((await app.diff({ scope: "session" })).details as any).to.id, first.id);
@@ -178,7 +228,7 @@ test("unreadable semantic card data renders a localized error instead of disappe
       assert.match(rendered(app, damaged), /Saved diff display data is unavailable/);
       await app.command("zh-CN");
       assert.match(rendered(app, damaged), /已保存的差异展示数据不可用/);
-      assert.doesNotMatch(rendered(app, damaged), /没有文件变化/);
+      assert.doesNotMatch(rendered(app, damaged), /没有文件变化|个文件有变化/);
       await app.command("en");
     }
   } finally { dispose(app.session); }
@@ -274,6 +324,7 @@ test("Chinese text, long paths, resizing, and paged expansion retain the full di
       const lines = component.render(width);
       assert.ok(lines.every(line => visibleWidth(line) <= width), `Every line must fit ${width} columns`);
       const flattened = lines.map(stripVTControlCharacters).join("").replace(/\s/g, "");
+      assert.ok(flattened.includes("1个文件有变化：新增1个。"));
       assert.ok(flattened.includes(path));
       assert.ok(flattened.includes("constline2099='中文English👩‍💻é';"));
       assert.ok(flattened.includes("END-OF-DIFF-中文"));

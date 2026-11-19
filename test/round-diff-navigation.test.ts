@@ -52,6 +52,7 @@ for (const mode of ["regular", "fullscreen"] as const) {
     const firstReply = "First saved response.";
     const secondUserText = "Continue with the second change.";
     const secondReply = "Second saved response.";
+    const firstSavedFileDetails = /1 file changed: 1 modified\. *\n *notes\.txt · Modified · \+1 -1/;
     let requests = 0;
     await useModel(app, () => responseStream(++requests === 1 ? {
       content: [{ type: "text", text: midRoundReply },
@@ -76,7 +77,7 @@ for (const mode of ["regular", "fullscreen"] as const) {
     assert.equal(await readFile(notes, "utf8"), "first saved line\n");
     assert.deepEqual((await app.diff({ scope: "turn" })).details, firstDiff);
     assert.equal(screen().match(/Round diff/g)?.length, 1, "The checkpoint should show its saved round diff");
-    assert.match(screen(), /notes.txt.*\+1.*-1/);
+    assert.match(screen(), firstSavedFileDetails);
     assert.doesNotMatch(screen(), /\+first saved line/);
     input("\x0f");
     assert.match(screen(), /-committed[\s\S]*\+first saved line/);
@@ -88,7 +89,7 @@ for (const mode of ["regular", "fullscreen"] as const) {
     await waitFor(() => app.manager.getLeafId() === firstCardLeaf && ui.getEditorText() === secondUserText,
       "Pi did not land before the user message and prefill its text");
     assert.equal(screen().match(/Round diff/g)?.length, 1, "The saved entry must not be shown twice");
-    assert.match(screen(), /notes.txt.*\+1.*-1/);
+    assert.match(screen(), firstSavedFileDetails);
     input("\x0f");
     assert.match(screen(), /-committed[\s\S]*\+first saved line/);
     assert.doesNotMatch(screen(), /second saved line/);
@@ -102,6 +103,7 @@ for (const mode of ["regular", "fullscreen"] as const) {
     await waitFor(() => app.manager.getLeafId() === firstAssistant.id && screen().includes("Navigated to selected point"),
       "Pi did not land at the checkpoint with restoration disabled");
     assert.equal(screen().match(/轮次差异/g)?.length, 1);
+    assert.match(screen(), /1 个文件有变化：修改 1 个。/);
     assert.doesNotMatch(screen(), /\+first saved line/);
     input("\x0f");
     assert.match(screen(), /-committed[\s\S]*\+first saved line/);

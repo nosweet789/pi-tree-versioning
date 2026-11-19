@@ -330,6 +330,26 @@ export function setRoundDiffPreview(ctx: ExtensionContext, language: Language, p
   ctx.ui.setWidget("tree-versioning.round-diff", widget);
 }
 
+function roundFileSummary(files: Comparison["files"], language: Language): string {
+  const counts = { modified: 0, added: 0, deleted: 0 };
+  for (const { status } of files) {
+    switch (status) {
+      case "modified":
+      case "type_changed": counts.modified++; break;
+      case "added": counts.added++; break;
+      case "deleted": counts.deleted++; break;
+    }
+  }
+
+  const changes: string[] = [];
+  if (counts.modified) changes.push(language.message("filesModifiedCount", { count: counts.modified }));
+  if (counts.added) changes.push(language.message("filesAddedCount", { count: counts.added }));
+  if (counts.deleted) changes.push(language.message("filesDeletedCount", { count: counts.deleted }));
+  return language.message(files.length === 1 ? "oneFileChanged" : "filesChanged", {
+    count: files.length, changes: changes.join(language.message("fileChangeSeparator")),
+  });
+}
+
 export function diffView(value: unknown, language: Language, options: DiffViewOptions, theme: Theme): Component & { hasComparison: boolean } {
   const comparison = Check(diffCardSchema, value) ? value as RecordedDiff : undefined;
   const text = new Text("", 0, 0);
@@ -360,6 +380,7 @@ export function diffView(value: unknown, language: Language, options: DiffViewOp
         depth: coverage.searchDepth, repositories: terminalText(JSON.stringify(coverage.repositories)),
       })));
       if (comparison.files.length === 0) lines.push(language.message("noFileChanges"));
+      else if (comparison.scope === "turn") lines.push(roundFileSummary(comparison.files, language));
       const inlineDiff = options.expanded ? inlineDiffer(comparison) : undefined;
       const statuses: Record<string, { label: MessageKey; color: ThemeColor }> = {
         added: { label: "fileAdded", color: "toolDiffAdded" },
