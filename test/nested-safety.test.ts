@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
-import { mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { test } from "node:test";
 import { dispose, fixture, git, load } from "./harness.ts";
 import { nestedRepository, setDepth } from "./nested-fixture.ts";
 import { responseStream, useModel } from "./agent-fixture.ts";
+import { capturePathsArtifact, checkpointArtifact, sharedFileStateArtifact, snapshotDirectory, snapshotEnvelope } from "./fault-fixture.ts";
 
 for (const damage of ["missing", "replaced", "symlink", "submodule", "unreadable"] as const) {
   test(`an enrolled repository becoming ${damage} cannot publish incomplete history or partially start restoration`, async t => {
@@ -146,35 +146,50 @@ test("repository search limits fail closed rather than publishing the discovered
   } finally { dispose(app.session); }
 });
 
-test("legacy snapshots remain root-only after setting depth and can still record and restore", async () => {
-  const workspace = await fixture();
-  const nested = await nestedRepository(workspace);
-  const app = await load(workspace);
-  try {
-    const baselineNode = app.manager.getLeafId()!;
-    await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
-    await writeFile(join(workspace.cwd, "notes.txt"), "saved parent\n");
-    await app.session.prompt("Create history in the legacy envelope.");
-    const storage = join(workspace.agentDir, "tree-versioning", app.manager.getSessionId());
-    // Compatibility injection uses the old on-disk envelope; assertions use public behavior.
-    for (const name of await readdir(storage)) {
-      const path = join(storage, name);
-      const { integrity: _integrity, repositoryScope: _scope, ...value } = JSON.parse(await readFile(path, "utf8"));
-      value.version = 1;
-      const integrity = createHash("sha256").update(JSON.stringify(value)).digest("hex");
-      await writeFile(path, JSON.stringify({ ...value, integrity }));
-    }
-    await app.session.prompt("/tree-versioning-repository-depth 1");
-    await app.session.reload();
-    assert.deepEqual(((await app.checkpoints()).details as any).coverage, { searchDepth: 0, repositories: ["."] });
-    await writeFile(join(nested, "notes.txt"), "nested manual\n");
-    assert.deepEqual(((await app.diff()).details as any).files, []);
-    await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
-    await writeFile(join(workspace.cwd, "notes.txt"), "continued parent\n");
-    await app.session.prompt("Continue the legacy session.");
-    assert.equal(((await app.checkpoints()).details as any).checkpoints.length, 2);
-    await app.session.navigateTree(baselineNode, { summarize: false });
-    assert.equal(await readFile(join(workspace.cwd, "notes.txt"), "utf8"), "committed\n");
-    assert.equal(await readFile(join(nested, "notes.txt"), "utf8"), "nested manual\n");
-  } finally { dispose(app.session); }
-});
+for (const version of [1, 2] as const) {
+  test(`inline version ${version} history remains root-only and usable with new checkpoints`, async () => {
+    const workspace = await fixture();
+    const nested = await nestedRepository(workspace);
+    const app = await load(workspace);
+    try {
+      const baselineNode = app.manager.getLeafId()!;
+      await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
+      await writeFile(join(workspace.cwd, "notes.txt"), "saved parent\n");
+      await app.session.prompt("Save a round to use in the legacy fixture.");
+      const sessionId = app.manager.getSessionId();
+      const { id, nodeId, capturedAt } = ((await app.checkpoints()).details as any).checkpoints[0];
+      const baselinePath = join(snapshotDirectory(workspace, sessionId), "baseline.json");
+      const { integrity: _integrity, repositoryScope, ...baseline } = JSON.parse(await readFile(baselinePath, "utf8"));
+      if (version === 1) await writeFile(baselinePath, snapshotEnvelope({ ...baseline, version }));
+      const checkpointPath = await checkpointArtifact(workspace, sessionId, id);
+      await rm(await sharedFileStateArtifact(workspace, sessionId, id));
+      await rm(capturePathsArtifact(workspace, sessionId, id));
+      const inline = snapshotEnvelope({
+        version, ...(version === 2 ? { repositoryScope } : {}), sessionId, workspaceRoot: workspace.cwd,
+        checkpoint: { id, nodeId, capturedAt },
+        files: { "notes.txt": { kind: "file", content: Buffer.from("saved parent\n").toString("base64"), executable: false } },
+      });
+      await writeFile(checkpointPath, inline);
+
+      await app.session.prompt("/tree-versioning-repository-depth 1");
+      await app.session.reload();
+      assert.deepEqual(((await app.checkpoints()).details as any).coverage, { searchDepth: 0, repositories: ["."] });
+      await writeFile(join(nested, "notes.txt"), "nested manual\n");
+      assert.deepEqual(((await app.diff()).details as any).files, []);
+      await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
+      await writeFile(join(workspace.cwd, "notes.txt"), "continued parent\n");
+      await app.session.prompt("Continue the legacy session.");
+      assert.equal(((await app.checkpoints()).details as any).checkpoints.length, 2);
+      const comparison = (await app.diff({ scope: "turn" })).details as any;
+      assert.equal(comparison.from.id, id);
+      assert.match(comparison.files[0].patch, /-saved parent\n\+continued parent/);
+      await app.session.navigateTree(nodeId, { summarize: false });
+      assert.equal(await readFile(join(workspace.cwd, "notes.txt"), "utf8"), "saved parent\n");
+      await app.session.navigateTree(baselineNode, { summarize: false });
+      assert.equal(await readFile(join(workspace.cwd, "notes.txt"), "utf8"), "committed\n");
+      assert.equal(await readFile(join(nested, "notes.txt"), "utf8"), "nested manual\n");
+      await app.session.reload();
+      assert.equal((await app.diff({ scope: "turn", checkpointId: id })).isError, false);
+    } finally { dispose(app.session); }
+  });
+}

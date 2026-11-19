@@ -7,7 +7,7 @@ import { initTheme, SessionManager, type CustomEntry, type Theme, type ThemeColo
 import { CustomEntryComponent } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/custom-entry.js";
 import { visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { dispose, fixture, git, load } from "./harness.ts";
-import { viewFixture } from "./view-fixture.ts";
+import { historyCards as cards, renderPlainText, viewFixture } from "./view-fixture.ts";
 import { assertStyledCharacters, styledCharacters } from "./terminal-style.ts";
 import { responseStream, useModel, type TestApp } from "./agent-fixture.ts";
 
@@ -421,11 +421,6 @@ for (const navigate of [false, true]) {
   });
 }
 
-function cards(app: TestApp) {
-  return app.manager.getEntries().filter((entry): entry is CustomEntry =>
-    entry.type === "custom" && !!app.session.extensionRunner.getEntryRenderer(entry.customType));
-}
-
 function cardComponent(app: TestApp, entry: CustomEntry, expanded = false) {
   const renderer = app.session.extensionRunner.getEntryRenderer(entry.customType)!;
   const component = renderer(entry, {
@@ -435,10 +430,6 @@ function cardComponent(app: TestApp, entry: CustomEntry, expanded = false) {
   }, app.session.extensionRunner.getUIContext().theme);
   assert.ok(component, "A persisted diff card must have visible content");
   return component;
-}
-
-function renderPlainText(component: Component, width: number) {
-  return component.render(width).map(line => stripVTControlCharacters(line).trimEnd()).join("\n");
 }
 
 function rendered(app: TestApp, entry: CustomEntry, expanded = false, width = 120) {

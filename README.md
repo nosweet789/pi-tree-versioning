@@ -166,7 +166,9 @@ Files ignored and untracked by their owning repository, unenrolled nested reposi
 
 Snapshots live under `~/.pi/agent/tree-versioning/<session-id>/`, following `PI_CODING_AGENT_DIR` when set. Keep the pi data directory and session files outside the managed working tree. Persistent sessions retain their file history across restarts; `--no-session` conversations end with the process.
 
-Snapshots are stored in full on the local machine and are cleaned up manually. Cross-machine synchronization is outside the supported scope. Large worktrees can use substantial memory and disk space, and long restores can pause the UI. Concurrent file writes and multi-file restoration have no cross-file atomicity guarantee.
+New round checkpoints within a session share one full snapshot when their managed file states are identical. Each round keeps its own checkpoint and diff card. The baseline is stored separately, and forks and clones keep their own copies of inherited data. Existing snapshots stay readable without migration.
+
+Snapshots are cleaned up manually. If removing a session's history, remove its snapshot directory as a whole rather than deleting individual files that checkpoints may share. Cross-machine synchronization is not supported. Large worktrees can use substantial memory and disk space, and long restores can pause the UI. Concurrent file writes and multi-file restoration have no cross-file atomicity guarantee.
 
 ## Language
 

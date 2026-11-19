@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { link, mkdir, readFile, readlink, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { dispose, fixture, git, load } from "./harness.ts";
 import { responseStream, useModel } from "./agent-fixture.ts";
+import { rewriteSharedFileState } from "./fault-fixture.ts";
 
 test("restoration replaces cyclic leaf links even when the index still names descendants", async () => {
   const workspace = await fixture();
@@ -122,22 +122,16 @@ for (const damage of ["traversal", "git-path", "conflicting-paths", "link-null"]
     const workspace = await fixture();
     const app = await load(workspace);
     try {
-      const storage = join(workspace.agentDir, "tree-versioning", app.manager.getSessionId());
-      const previous = new Set(await readdir(storage));
       await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
       await app.session.prompt("Record snapshot to damage.");
       const target = ((await app.checkpoints()).details as any).checkpoints[0];
-      const name = (await readdir(storage)).find(name => !previous.has(name))!;
-      const path = join(storage, name);
-      const { integrity: _integrity, ...data } = JSON.parse(await readFile(path, "utf8"));
-      const state = { kind: "file", content: Buffer.from("must not escape\n").toString("base64"), executable: false };
-      if (damage === "traversal") data.files["../outside.txt"] = state;
-      if (damage === "git-path") data.files[".GIT/config"] = state;
-      if (damage === "conflicting-paths") { data.files.conflict = state; data.files["conflict/child"] = state; }
-      if (damage === "link-null") data.files.invalid = { kind: "symlink", target: "AA==", targetEncoding: "base64" };
-      // Fault injection intentionally knows the storage envelope; assertions use only public effects.
-      const integrity = createHash("sha256").update(JSON.stringify(data)).digest("hex");
-      await writeFile(path, JSON.stringify({ ...data, integrity }));
+      await rewriteSharedFileState(workspace, app.manager.getSessionId(), target.id, files => {
+        const state = { kind: "file", content: Buffer.from("must not escape\n").toString("base64"), executable: false };
+        if (damage === "traversal") files["../outside.txt"] = state;
+        if (damage === "git-path") files[".GIT/config"] = state;
+        if (damage === "conflicting-paths") { files.conflict = state; files["conflict/child"] = state; }
+        if (damage === "link-null") files.invalid = { kind: "symlink", target: "AA==", targetEncoding: "base64" };
+      });
       await writeFile(join(workspace.root, "outside.txt"), "outside stays\n");
       await writeFile(join(workspace.cwd, "notes.txt"), "manual edit stays\n");
       const config = await readFile(join(workspace.cwd, ".git", "config"));

@@ -258,6 +258,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
       if (!ctx.sessionManager.getBranch().some(entry => entry.id === checkpoint.nodeId)) {
         throw new VersioningError("storage_failed", "Session left the settled node ancestry during checkpoint collection.");
       }
+      recorded.assertStillSaved();
       // One publication keeps the association and its display on the same native branch.
       pi.appendEntry(checkpointEntryType, { ...checkpoint, diff: comparison });
     } catch (error) {

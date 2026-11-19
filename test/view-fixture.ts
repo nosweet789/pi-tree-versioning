@@ -1,11 +1,30 @@
 import assert from "node:assert/strict";
-import type { ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
+import { stripVTControlCharacters } from "node:util";
+import type { CustomEntry, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js";
 import { createChatViewport } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/chat-viewport.js";
+import { CustomEntryComponent } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/custom-entry.js";
 import {
   Container, getKeybindings, Input, setKeybindings, Text, TuiAltScreen, TuiMainScreen,
   type Component, type OverlayHandle, type Terminal,
 } from "@earendil-works/pi-tui";
+import type { TestApp } from "./agent-fixture.ts";
+
+export function historyCards(app: TestApp) {
+  return app.manager.getEntries().filter((entry): entry is CustomEntry =>
+    entry.type === "custom" && !!app.session.extensionRunner.getEntryRenderer(entry.customType));
+}
+
+export function renderPlainText(component: Component, width: number) {
+  return component.render(width).map(line => stripVTControlCharacters(line).trimEnd()).join("\n");
+}
+
+export function renderedHistoryCards(app: TestApp) {
+  return historyCards(app).map(entry => {
+    const renderer = app.session.extensionRunner.getEntryRenderer(entry.customType)!;
+    return renderPlainText(new CustomEntryComponent(entry, renderer), 120);
+  });
+}
 
 export function viewFixture(mode: "regular" | "fullscreen" = "regular", widgetRows = 0, belowRows = 0) {
   let input: (data: string) => void = () => {};

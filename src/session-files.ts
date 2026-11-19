@@ -71,15 +71,18 @@ function savedRoundDiff(data: CheckpointEntryData): unknown {
 type FileState = { kind: "file"; content: string; executable: boolean } |
   { kind: "symlink"; target: string; targetEncoding: "utf8" | "base64" };
 
-interface FileSnapshot {
-  version: 1 | 2;
+interface SnapshotIdentity {
   repositoryScope?: RepositoryScope;
   sessionId: string;
   workspaceRoot: string;
+}
+
+interface FileSnapshot extends SnapshotIdentity {
   files: Record<string, FileState>;
 }
 
 interface Snapshot extends FileSnapshot {
+  version: 1 | 2;
   baseline: { id: string; capturedAt: string; anchorId: string | null };
   priorEntryIds: string[];
   inheritedCheckpoints?: Checkpoint[];
@@ -91,8 +94,27 @@ interface Checkpoint {
   nodeId: string;
 }
 
-interface CheckpointSnapshot extends FileSnapshot {
+interface CheckpointMetadata extends SnapshotIdentity {
   checkpoint: Checkpoint;
+}
+
+type CheckpointSnapshot = CheckpointMetadata & Pick<FileSnapshot, "files">;
+type InlineCheckpoint = CheckpointSnapshot & { version: 1 | 2 };
+
+interface FileStateReference {
+  digest: string;
+  integrity: string;
+}
+
+interface CheckpointReference extends CheckpointMetadata {
+  version: 3;
+  fileState: FileStateReference;
+}
+
+type StoredCheckpoint = InlineCheckpoint | CheckpointReference;
+
+function referencesFileState(snapshot: StoredCheckpoint): snapshot is CheckpointReference {
+  return snapshot.version === 3;
 }
 
 interface SnapshotFileStamp {
@@ -108,18 +130,43 @@ function isCheckpoint(value: unknown): value is Checkpoint {
     typeof checkpoint.nodeId === "string" && typeof checkpoint.capturedAt === "string";
 }
 
-function checksum(snapshot: FileSnapshot): string {
-  return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+function checksum(data: string): string {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+function isDigest(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function checkpointName(checkpoint: Checkpoint) { return `checkpoint-${checkpoint.id}.json`; }
+function fileStateName(digest: string) { return `file-state-${digest}.json`; }
+function checkpointPathsName(checkpoint: Checkpoint) { return `capture-paths-${checkpoint.id}.json`; }
+
+function encodeFileState(contents: string, digest: string, instanceId: string) {
+  const integrity = checksum(`${digest}:${instanceId}`);
+  return { reference: { digest, integrity }, data: `{"instanceId":"${instanceId}","files":${contents},"integrity":"${integrity}"}` };
+}
+
+function decodeFileState(data: string) {
+  const { instanceId, files } = JSON.parse(data);
+  const contents = JSON.stringify(files);
+  if (contents === undefined || typeof instanceId !== "string" || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(instanceId)) {
+    throw new Error("Invalid saved file state identity");
+  }
+  const encoded = encodeFileState(contents, checksum(contents), instanceId);
+  if (data !== encoded.data) throw new Error("Invalid saved file state checksum");
+  return { contents, files: files as unknown, reference: encoded.reference };
 }
 
 function parseSnapshot(text: string, kind: "baseline"): Snapshot;
-function parseSnapshot(text: string, kind: "checkpoint"): CheckpointSnapshot;
-function parseSnapshot(text: string, kind: "baseline" | "checkpoint"): Snapshot | CheckpointSnapshot {
+function parseSnapshot(text: string, kind: "checkpoint"): StoredCheckpoint;
+function parseSnapshot(text: string, kind: "baseline" | "checkpoint"): Snapshot | StoredCheckpoint {
   const { integrity, ...value } = JSON.parse(text);
-  if (integrity !== checksum(value as Snapshot) || ![1, 2].includes(value.version) ||
-      (value.version === 2 ? !isRepositoryScope(value.repositoryScope) : value.repositoryScope !== undefined) ||
+  const reference = kind === "checkpoint" && value.version === 3;
+  const hasScope = value.repositoryScope !== undefined;
+  if (integrity !== checksum(JSON.stringify(value)) || (!reference && ![1, 2].includes(value.version)) ||
+      (value.version === 2 || (reference && hasScope) ? !isRepositoryScope(value.repositoryScope) : hasScope) ||
       typeof value.sessionId !== "string" || typeof value.workspaceRoot !== "string" ||
-      !value.files || typeof value.files !== "object" || Array.isArray(value.files) ||
       (kind === "checkpoint" ? !isCheckpoint(value.checkpoint) :
         typeof value.baseline?.id !== "string" || typeof value.baseline?.capturedAt !== "string" ||
         !(value.baseline.anchorId === null || typeof value.baseline.anchorId === "string") ||
@@ -127,7 +174,19 @@ function parseSnapshot(text: string, kind: "baseline" | "checkpoint"): Snapshot 
         value.inheritedCheckpoints !== undefined && (!Array.isArray(value.inheritedCheckpoints) || !value.inheritedCheckpoints.every(isCheckpoint)))) {
     throw new Error("Invalid snapshot data or integrity checksum");
   }
-  for (const [path, state] of Object.entries(value.files) as [string, FileState][]) {
+  if (reference) {
+    if (!isDigest(value.fileState?.digest) || !isDigest(value.fileState?.integrity) || Object.hasOwn(value, "files")) {
+      throw new Error("Invalid checkpoint file state reference");
+    }
+    return value as CheckpointReference;
+  }
+  value.files = validateFileStates(value.files);
+  return value as Snapshot | InlineCheckpoint;
+}
+
+function validateFileStates(files: unknown): Record<string, FileState> {
+  if (!files || typeof files !== "object" || Array.isArray(files)) throw new Error("Invalid snapshot file states");
+  for (const [path, state] of Object.entries(files) as [string, FileState][]) {
     if (!validPath(path) || !state ||
         !(state.kind === "file" && typeof state.content === "string" && typeof state.executable === "boolean" &&
           Buffer.from(state.content, "base64").toString("base64") === state.content ||
@@ -141,11 +200,10 @@ function parseSnapshot(text: string, kind: "baseline" | "checkpoint"): Snapshot 
     }
     const segments = path.split("/");
     for (let length = 1; length < segments.length; length++) {
-      if (Object.hasOwn(value.files, segments.slice(0, length).join("/"))) throw new Error("Conflicting snapshot paths");
+      if (Object.hasOwn(files, segments.slice(0, length).join("/"))) throw new Error("Conflicting snapshot paths");
     }
   }
-  value.files = Object.assign(Object.create(null), value.files);
-  return value as Snapshot | CheckpointSnapshot;
+  return Object.assign(Object.create(null), files);
 }
 
 async function capture(root: string, repositories?: RepositoryScope, knownPaths: string[] = []): Promise<Record<string, FileState>> {
@@ -322,14 +380,15 @@ export class SessionFiles {
     try {
       const stat = await handle.stat({ bigint: true });
       if (!stat.isFile()) throw new Error("Stored data is not a regular file");
-      const text = await handle.readFile("utf8");
+      const data = await handle.readFile();
+      if (!isUtf8(data)) throw new Error("Stored data is not valid UTF-8");
       stamps?.push({ path, stat });
-      return text;
+      return data.toString("utf8");
     } finally { await handle.close(); }
   }
 
-  // Snapshots are immutable. Check the files actually read, without loading a second
-  // copy of history or introducing another await between the final check and writes.
+  // Recheck the files actually read without opening a window between the final
+  // check and association or workspace writes.
   private assertSnapshotFilesStillMatch(stamps: SnapshotFileStamp[]) {
     try {
       for (const { path, stat } of stamps) {
@@ -344,17 +403,118 @@ export class SessionFiles {
         accessSync(path, constants.R_OK);
       }
     } catch (error) {
-      throw new VersioningError("snapshot_unavailable", "The selected restore history is no longer available. " + String(error));
+      throw new VersioningError("snapshot_unavailable", "Saved file data changed or became unavailable. " + String(error));
     }
   }
 
-  private async publishSnapshot(path: string, snapshot: FileSnapshot) {
+  private async publishFile(path: string, data: string) {
     const temporary = path + "." + randomUUID() + ".tmp";
     try {
-      await writeFile(temporary, JSON.stringify({ ...snapshot, integrity: checksum(snapshot) }), { mode: 0o600, flag: "wx" });
+      await writeFile(temporary, data, { mode: 0o600, flag: "wx" });
       // Immutable publication never overwrites another snapshot.
       await link(temporary, path);
     } finally { await rm(temporary, { force: true }); }
+  }
+
+  private async publishSnapshot(path: string, snapshot: Snapshot | StoredCheckpoint, stamps?: SnapshotFileStamp[]) {
+    const data = JSON.stringify({ ...snapshot, integrity: checksum(JSON.stringify(snapshot)) });
+    await this.publishFile(path, data);
+    if (stamps && await this.readRegularFile(path, stamps) !== data) throw new Error("Published snapshot changed.");
+  }
+
+  private async saveFileState(sessionId: string, files: Record<string, FileState>, stamps: SnapshotFileStamp[]): Promise<FileStateReference> {
+    // Git lists tracked and untracked paths separately. The order of collection
+    // is not part of the file state.
+    const contents = JSON.stringify(Object.fromEntries(Object.keys(files).sort().map(path => [path, files[path]])));
+    const digest = checksum(contents);
+    const path = await this.storagePath(sessionId, false, fileStateName(digest));
+    let stored = await this.readRegularFile(path, stamps).catch(error => {
+      if (error.code !== "ENOENT") throw error;
+      return undefined;
+    });
+    if (stored === undefined) {
+      // Bind references to this particular publication. A fresh capture of the
+      // same contents must not silently resurrect checkpoints that lost their data.
+      const fresh = encodeFileState(contents, digest, randomUUID());
+      try { await this.publishFile(path, fresh.data); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      stored = await this.readRegularFile(path, stamps);
+      if (stored === fresh.data) return fresh.reference;
+    }
+    try {
+      const decoded = decodeFileState(stored);
+      if (decoded.contents !== contents) throw new Error("Existing saved file state does not match its content address.");
+      return decoded.reference;
+    } catch (error) {
+      throw new VersioningError("snapshot_unavailable", `Saved file state ${digest} is corrupt. ${String(error)}`);
+    }
+  }
+
+  private async readFileState(sessionId: string, reference: FileStateReference, stamps?: SnapshotFileStamp[]) {
+    try {
+      const path = await this.storagePath(sessionId, false, fileStateName(reference.digest));
+      const data = await this.readRegularFile(path, stamps);
+      const decoded = decodeFileState(data);
+      if (decoded.reference.digest !== reference.digest || decoded.reference.integrity !== reference.integrity) {
+        throw new Error("Saved file state does not match the checkpoint's reference");
+      }
+      return { data, files: validateFileStates(decoded.files) };
+    } catch (error) {
+      throw new VersioningError("snapshot_unavailable", `Saved file state ${reference.digest} is missing, unreadable, or corrupt. ${String(error)}`);
+    }
+  }
+
+  private async readUniqueFileState(snapshot: StoredCheckpoint, checked: Map<string, string>) {
+    if (!referencesFileState(snapshot)) return undefined;
+    const { digest, integrity } = snapshot.fileState;
+    const previous = checked.get(digest);
+    if (previous === integrity) return undefined;
+    if (previous !== undefined) throw new VersioningError("snapshot_unavailable", "Checkpoints refer to different publications of the same file state.");
+    const { data, files } = await this.readFileState(snapshot.sessionId, snapshot.fileState);
+    checked.set(digest, integrity);
+    return { digest, data, paths: Object.keys(files) };
+  }
+
+  // Keep just the path set independently of snapshot data, so capture can enforce
+  // repository ownership even when the round comparison cannot read its predecessor.
+  private async saveOwnedPaths(directory: string, paths: string[]) {
+    const contents = JSON.stringify(paths.sort());
+    const integrity = checksum(contents);
+    const data = JSON.stringify({ paths, integrity });
+    const path = join(directory, `owned-paths-${integrity}.json`);
+    let existing = await this.readRegularFile(path).catch(error => {
+      if (error.code !== "ENOENT") throw error;
+      return undefined;
+    });
+    if (existing === undefined) {
+      try { await this.publishFile(path, data); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      existing = await this.readRegularFile(path);
+    }
+    if (existing !== data) throw new Error("Invalid saved path set");
+    return path;
+  }
+
+  private async knownPaths(baseline: Snapshot, previous?: Checkpoint) {
+    if (!previous) return Object.keys(baseline.files);
+    const path = await this.storagePath(baseline.sessionId, false, checkpointPathsName(previous));
+    try {
+      const { paths, integrity } = JSON.parse(await this.readRegularFile(path));
+      if (!Array.isArray(paths) || !paths.every(path => typeof path === "string" && validPath(path)) ||
+          checksum(JSON.stringify(paths)) !== integrity) throw new Error("Invalid saved path set");
+      return paths as string[];
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new VersioningError("snapshot_unavailable", `Saved paths for checkpoint ${previous.id} are unreadable or corrupt. ${String(error)}`);
+      }
+    }
+    const saved = await this.readCheckpointEnvelope(baseline, previous).catch(error => {
+      if (!(error instanceof VersioningError) || error.code !== "snapshot_unavailable") throw error;
+      return undefined;
+    });
+    // Keep the legacy baseline preflight when both the predecessor envelope and
+    // its path record are gone. An intact reference must still supply its paths.
+    return Object.keys(saved ? await this.checkpointFiles(saved) : baseline.files);
   }
 
   private hasBaselineRecord(position: SessionPosition) {
@@ -591,21 +751,27 @@ export class SessionFiles {
     };
     const anchorId = baseline.baseline.anchorId !== null && this.baselineCovers(baseline, sourceBranch)
       ? copiedNode(baseline.baseline.anchorId) ?? baseline.baseline.anchorId : baseline.baseline.anchorId;
-    const checkpoints: CheckpointSnapshot[] = [];
-    for (const record of this.checkpointRecords(source, baseline)) {
-      const nodeId = copiedNode(record.nodeId);
-      if (nodeId) {
-        const snapshot = await this.loadCheckpoint(source, record, root, baseline.repositoryScope);
-        checkpoints.push({ ...snapshot, checkpoint: { id: record.id, capturedAt: record.capturedAt, nodeId } });
-      }
-    }
-    const inheritedCheckpoints = checkpoints.map(snapshot => snapshot.checkpoint);
     const destination = await this.storagePath(position.sessionId, true);
     const staging = await mkdtemp(join(this.storageDir, ".inherit-"));
     try {
-      for (const snapshot of checkpoints) {
-        await this.publishSnapshot(join(staging, "checkpoint-" + snapshot.checkpoint.id + ".json"),
-          { ...snapshot, sessionId: position.sessionId });
+      const inheritedCheckpoints: Checkpoint[] = [];
+      const copiedFileStates = new Map<string, string>();
+      const copiedOwnedPaths = new Map<string, string>();
+      for (const record of this.checkpointRecords(source, baseline)) {
+        const nodeId = copiedNode(record.nodeId);
+        if (!nodeId) continue;
+        const snapshot = await this.readCheckpointEnvelope(baseline, record);
+        const shared = await this.readUniqueFileState(snapshot, copiedFileStates);
+        // Publish a local copy, not a link to the source session's files.
+        if (shared) {
+          await this.publishFile(join(staging, fileStateName(shared.digest)), shared.data);
+          copiedOwnedPaths.set(shared.digest, await this.saveOwnedPaths(staging, shared.paths));
+        }
+        const checkpoint = { id: record.id, capturedAt: record.capturedAt, nodeId };
+        if (referencesFileState(snapshot)) await link(copiedOwnedPaths.get(snapshot.fileState.digest)!, join(staging, checkpointPathsName(checkpoint)));
+        await this.publishSnapshot(join(staging, checkpointName(checkpoint)),
+          { ...snapshot, checkpoint, sessionId: position.sessionId });
+        inheritedCheckpoints.push(checkpoint);
       }
       const inheritedBaseline: Snapshot = { ...baseline, sessionId: position.sessionId,
         baseline: { ...baseline.baseline, anchorId }, inheritedCheckpoints };
@@ -613,6 +779,7 @@ export class SessionFiles {
       // Publish the complete independent history at once, never a partial baseline.
       await rename(staging, dirname(destination));
     } catch (error) {
+      if (error instanceof VersioningError) throw error;
       throw new VersioningError("storage_failed", String(error));
     } finally { await rm(staging, { recursive: true, force: true }); }
   }
@@ -668,28 +835,23 @@ export class SessionFiles {
     if (!position.leafId) throw new VersioningError("capture_failed", "The round has no native session node.");
     const checkpoint: Checkpoint = { id: randomUUID(), nodeId: position.leafId, capturedAt: new Date().toISOString() };
     const previous = this.nearestCheckpoint(this.checkpointRecords(position, baseline), this.branchAt(position, position.leafId));
-    let known: FileSnapshot = baseline;
-    if (previous) {
-      try { known = await this.loadCheckpoint(position, previous, baseline.workspaceRoot, baseline.repositoryScope); }
-      catch (error) {
-        // A missing predecessor prevents its diff, not an independent capture of disk.
-        if (!(error instanceof VersioningError) || error.code !== "snapshot_unavailable") throw error;
-      }
-    }
-    const snapshot: CheckpointSnapshot = {
-      version: baseline.version, ...(baseline.repositoryScope ? { repositoryScope: baseline.repositoryScope } : {}),
-      sessionId: position.sessionId, workspaceRoot: baseline.workspaceRoot,
-      checkpoint, files: await capture(baseline.workspaceRoot, baseline.repositoryScope, Object.keys(known.files)),
-    };
+    const knownPaths = await this.knownPaths(baseline, previous);
+    const files = await capture(baseline.workspaceRoot, baseline.repositoryScope, knownPaths);
+    const metadata = { sessionId: position.sessionId, workspaceRoot: baseline.workspaceRoot, repositoryScope: baseline.repositoryScope, checkpoint };
+    const stamps: SnapshotFileStamp[] = [];
     try {
-      const path = await this.storagePath(position.sessionId, false, "checkpoint-" + checkpoint.id + ".json");
-      await this.publishSnapshot(path, snapshot);
+      const fileState = await this.saveFileState(position.sessionId, files, stamps);
+      const path = await this.storagePath(position.sessionId, false, checkpointName(checkpoint));
+      const ownedPaths = await this.saveOwnedPaths(dirname(path), Object.keys(files));
+      await link(ownedPaths, join(dirname(path), checkpointPathsName(checkpoint)));
+      await this.publishSnapshot(path, { ...metadata, version: 3, fileState }, stamps);
     } catch (error) {
+      if (error instanceof VersioningError) throw error;
       throw new VersioningError("storage_failed", String(error));
     }
-    const comparison = await this.compare(position, { scope: "turn" }, snapshot)
+    const comparison = await this.compare(position, { scope: "turn" }, { ...metadata, files })
       .catch(error => unavailableRoundDiff(checkpoint.id, error));
-    return { checkpoint, comparison };
+    return { checkpoint, comparison, assertStillSaved: () => this.assertSnapshotFilesStillMatch(stamps) };
   }
 
   // Only an exact-node filter can skip an entry. A damaged match is an error.
@@ -746,7 +908,7 @@ export class SessionFiles {
       const baseline = await this.readBaseline(position).catch(() => undefined);
       if (!baseline) return undefined;
       for (const endpoint of detachedEndpoints) {
-        const snapshot = await this.loadCheckpoint(position, endpoint, baseline.workspaceRoot, baseline.repositoryScope)
+        const snapshot = await this.loadCheckpoint(baseline, endpoint)
           .catch(() => undefined);
         if (snapshot) return { nodeId: leafId, diff: undefined };
       }
@@ -770,14 +932,14 @@ export class SessionFiles {
     return [...merged.values()];
   }
 
-  private async loadCheckpoint(position: SessionPosition, checkpoint: Checkpoint, root: string, scope?: RepositoryScope, stamps?: SnapshotFileStamp[]) {
+  private async readCheckpointEnvelope(identity: SnapshotIdentity, checkpoint: Checkpoint, stamps?: SnapshotFileStamp[]) {
     try {
-      const path = await this.storagePath(position.sessionId, false, "checkpoint-" + checkpoint.id + ".json");
+      const path = await this.storagePath(identity.sessionId, false, checkpointName(checkpoint));
       const snapshot = parseSnapshot(await this.readRegularFile(path, stamps), "checkpoint");
-      if (snapshot.sessionId !== position.sessionId || snapshot.workspaceRoot !== root ||
+      if (snapshot.sessionId !== identity.sessionId || snapshot.workspaceRoot !== identity.workspaceRoot ||
           snapshot.checkpoint.id !== checkpoint.id || snapshot.checkpoint.nodeId !== checkpoint.nodeId ||
           snapshot.checkpoint.capturedAt !== checkpoint.capturedAt ||
-          JSON.stringify(snapshot.repositoryScope) !== JSON.stringify(scope)) {
+          JSON.stringify(snapshot.repositoryScope) !== JSON.stringify(identity.repositoryScope)) {
         throw new Error("Checkpoint identity or association does not match.");
       }
       return snapshot;
@@ -786,11 +948,21 @@ export class SessionFiles {
     }
   }
 
+  private async checkpointFiles(snapshot: StoredCheckpoint, stamps?: SnapshotFileStamp[]) {
+    if (!referencesFileState(snapshot)) return snapshot.files;
+    return (await this.readFileState(snapshot.sessionId, snapshot.fileState, stamps)).files;
+  }
+
+  private async loadCheckpoint(identity: SnapshotIdentity, checkpoint: Checkpoint, stamps?: SnapshotFileStamp[]): Promise<CheckpointSnapshot> {
+    const snapshot = await this.readCheckpointEnvelope(identity, checkpoint, stamps);
+    return { ...snapshot, files: await this.checkpointFiles(snapshot, stamps) };
+  }
+
   private baselineEndpoint(snapshot: Snapshot) {
     return { kind: "baseline" as const, sessionId: snapshot.sessionId, workspaceRoot: snapshot.workspaceRoot, ...snapshot.baseline };
   }
 
-  private checkpointEndpoint(snapshot: CheckpointSnapshot) {
+  private checkpointEndpoint(snapshot: CheckpointMetadata) {
     return { kind: "checkpoint" as const, sessionId: snapshot.sessionId, workspaceRoot: snapshot.workspaceRoot, ...snapshot.checkpoint };
   }
 
@@ -815,8 +987,11 @@ export class SessionFiles {
     const snapshot = await this.load(position);
     const records = this.checkpointRecords(position, snapshot);
     const checkpoints: ReturnType<SessionFiles["checkpointEndpoint"]>[] = [];
+    const sharedStates = new Map<string, string>();
     for (const record of records) {
-      checkpoints.push(this.checkpointEndpoint(await this.loadCheckpoint(position, record, snapshot.workspaceRoot, snapshot.repositoryScope)));
+      const saved = await this.readCheckpointEnvelope(snapshot, record);
+      await this.readUniqueFileState(saved, sharedStates);
+      checkpoints.push(this.checkpointEndpoint(saved));
     }
     const branch = this.branchAt(position, position.leafId);
     const current = this.nearestCheckpoint(checkpoints, branch);
@@ -844,10 +1019,10 @@ export class SessionFiles {
 
   async restore(position: SessionPosition, stillCurrent: () => boolean,
     confirm?: (target: RestoreTarget) => Promise<boolean>): Promise<RestoreTarget | undefined> {
-    const stamps: SnapshotFileStamp[] | undefined = confirm ? [] : undefined;
+    const stamps: SnapshotFileStamp[] = [];
     const assertReady = () => {
       if (!stillCurrent()) throw new VersioningError("restore_superseded", "The restore destination is no longer current.");
-      if (stamps) this.assertSnapshotFilesStillMatch(stamps);
+      this.assertSnapshotFilesStillMatch(stamps);
     };
     const baseline = await this.load(position, stamps);
     await this.assertExternalPersistence(position, baseline.workspaceRoot);
@@ -856,8 +1031,9 @@ export class SessionFiles {
     if (!checkpoint && !this.baselineCovers(baseline, branch)) {
       throw new VersioningError("no_baseline", "No saved file history covers the navigation destination.");
     }
-    const snapshot = checkpoint ? await this.loadCheckpoint(position, checkpoint, baseline.workspaceRoot, baseline.repositoryScope, stamps) : baseline;
-    const target = checkpoint ? this.checkpointEndpoint(snapshot as CheckpointSnapshot) : this.baselineEndpoint(baseline);
+    const saved = checkpoint && await this.loadCheckpoint(baseline, checkpoint, stamps);
+    const snapshot = saved ?? baseline;
+    const target = saved ? this.checkpointEndpoint(saved) : this.baselineEndpoint(baseline);
     if (confirm) {
       assertReady();
       if (await confirm(target) !== true) return;
@@ -914,7 +1090,7 @@ export class SessionFiles {
       return { endpoint: this.baselineEndpoint(snapshot), files: snapshot.files };
     };
     const saved = async (record: Checkpoint) => {
-      const savedSnapshot = await this.loadCheckpoint(position, record, snapshot.workspaceRoot, snapshot.repositoryScope);
+      const savedSnapshot = await this.loadCheckpoint(snapshot, record);
       return { endpoint: this.checkpointEndpoint(savedSnapshot), files: savedSnapshot.files };
     };
     const branch = checkpoint ? this.branchAt(position, checkpoint.nodeId) : currentBranch;
