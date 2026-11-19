@@ -1,6 +1,6 @@
 import type { EntryRenderOptions, ExtensionContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Container, ScrollView, Text, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TUI } from "@earendil-works/pi-tui";
-import type { RecordedDiff, SessionFiles } from "./session-files.ts";
+import type { RecordedDiff, RoundDiffPreview, SessionFiles } from "./session-files.ts";
 import type { Language, MessageKey } from "./language.ts";
 import { errorCodes } from "./errors.ts";
 import { comparisonOutput } from "./tool-contract.ts";
@@ -8,6 +8,9 @@ import { Type } from "typebox";
 import { Check } from "typebox/value";
 import { formatPatch } from "diff";
 import { createInlineDiffer, type InlineSpan } from "./inline-diff.ts";
+
+export const diffCommandName = "tree-versioning-diff";
+export const roundDiffArgument = "round";
 
 type Comparison = Awaited<ReturnType<SessionFiles["diff"]>>;
 const diffCardSchema = Type.Union([comparisonOutput, Type.Object({
@@ -222,17 +225,24 @@ function* renderPatch(patch: string, path: string, theme: Theme, width: number, 
   }
 }
 
-function panelHeight(tui: TUI, viewer: Component, width: number): number {
-  const containsViewer = (component: Component): boolean => component === viewer ||
-    (component instanceof Container && component.children.some(containsViewer));
+function remainingDockRows(tui: TUI, panel: Component, width: number): number {
+  const containsPanel = (component: Component): boolean => component === panel ||
+    (component instanceof Container && component.children.some(containsPanel));
+  const height = (component: Component): number => {
+    if (component === panel) return 0;
+    if (component instanceof Container && component.children.some(containsPanel)) {
+      return component.children.reduce((rows, child) => rows + height(child), 0);
+    }
+    return component.render(width).length;
+  };
   // Pi mounts the transcript first, followed by dock components, in both modes.
-  // Reserve their natural heights so fullscreen never clips our scrolling viewport.
-  const dockHeight = tui.children.slice(1).filter(component => !containsViewer(component))
-    .reduce((height, component) => height + component.render(width).length, 0);
-  return Math.max(0, Math.min(Math.floor(tui.terminal.rows / 2), Math.max(2, tui.terminal.rows - dockHeight - 1)));
+  // Count other content in the dock, including sibling widgets and the editor
+  // slot when it holds a native selector.
+  const occupied = tui.children.slice(1).reduce((rows, component) => rows + height(component), 0);
+  return tui.terminal.rows - occupied - 1;
 }
 
-export async function showDiff(comparison: Comparison, language: Language, ctx: ExtensionContext) {
+export async function showDiff(comparison: unknown, language: Language, ctx: ExtensionContext) {
   await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
     let expanded = false;
     const options: EntryRenderOptions = {
@@ -245,7 +255,7 @@ export async function showDiff(comparison: Comparison, language: Language, ctx: 
     const viewer: Component = {
       capturesViewportInput: true,
       render(width) {
-        const available = panelHeight(tui, viewer, width);
+        const available = Math.min(Math.floor(tui.terminal.rows / 2), Math.max(2, remainingDockRows(tui, viewer, width)));
         const help = language.message("viewerKeys", {
           scroll: options.keyText("tui.select.up") + "/" + options.keyText("tui.select.down"),
           page: options.keyText("tui.select.pageUp") + "/" + options.keyText("tui.select.pageDown"),
@@ -282,11 +292,50 @@ export async function showDiff(comparison: Comparison, language: Language, ctx: 
   });
 }
 
-export function diffView(value: unknown, language: Language, options: EntryRenderOptions, theme: Theme): Component {
+type DiffViewOptions = Pick<EntryRenderOptions, "expanded"> & Partial<Pick<EntryRenderOptions, "keyHint">>;
+
+export function setRoundDiffPreview(ctx: ExtensionContext, language: Language, preview?: RoundDiffPreview) {
+  const widget = preview && ((tui: TUI, theme: Theme): Component => {
+    const content = diffView(preview.diff, language, { get expanded() { return ctx.ui.getToolsExpanded(); } }, theme);
+    let measuring = false;
+    const panel: Component = {
+      render(width) {
+        if (width < 1 || measuring || ctx.sessionManager.getLeafId() !== preview.nodeId) return [];
+        // Other widgets can also measure the dock. Do not recurse via theirs.
+        measuring = true;
+        let height: number;
+        try { height = Math.min(Math.floor(tui.terminal.rows / 2), remainingDockRows(tui, panel, width)); }
+        finally { measuring = false; }
+        if (height < 1) return [];
+        let lines = content.render(width);
+        if (lines.length > height) {
+          if (!content.hasComparison) {
+            const error = theme.fg("error", language.message("diffUnavailableTitle"));
+            lines = [error, ...lines.slice(0, height - 1)];
+          } else if (height > 1) {
+            const command = `/${diffCommandName} ${roundDiffArgument}`;
+            const label = command + " " + language.message("roundDiffFullView");
+            // An incomplete command would open the session diff instead.
+            const hint = visibleWidth(label) <= width ? label :
+              command.length <= width ? command : language.message("roundDiffWiden");
+            lines = [lines[0], theme.fg("dim", hint), ...lines.slice(1, height - 1)];
+          }
+        }
+        return lines.slice(0, height).map(line => truncateToWidth(line, width));
+      },
+      invalidate() { content.invalidate(); },
+    };
+    return panel;
+  });
+  ctx.ui.setWidget("tree-versioning.round-diff", widget);
+}
+
+export function diffView(value: unknown, language: Language, options: DiffViewOptions, theme: Theme): Component & { hasComparison: boolean } {
   const comparison = Check(diffCardSchema, value) ? value as RecordedDiff : undefined;
   const text = new Text("", 0, 0);
   let patchLayout: { width: number; files: Map<string, string> } | undefined;
   return {
+    hasComparison: comparison?.status === "ok",
     render(width) {
       if (width < 1) return [];
       if (!comparison) {
@@ -333,7 +382,10 @@ export function diffView(value: unknown, language: Language, options: EntryRende
           lines.push(rendered);
         }
       }
-      if (!inlineDiff && comparison.files.some(file => file.patch)) lines.push(theme.fg("dim", options.keyHint("app.tools.expand", language.message("expandDiff"))));
+      if (!inlineDiff && comparison.files.some(file => file.patch)) {
+        const hint = options.keyHint?.("app.tools.expand", language.message("expandDiff")) ?? language.message("roundDiffExpand");
+        lines.push(theme.fg("dim", hint));
+      }
       text.setText(lines.join("\n"));
       return text.render(width);
     },

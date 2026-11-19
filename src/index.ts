@@ -2,12 +2,12 @@ import { getAgentDir, truncateHead, type ExtensionAPI, type ExtensionContext } f
 import { join } from "node:path";
 import { checkpointsOutput, checkpointsParameters, diffOutput, diffParameters, statusOutput, statusParameters } from "./tool-contract.ts";
 export type { CheckpointsInput, DiffInput, StatusInput } from "./tool-contract.ts";
-import { SessionFiles, type SessionPosition } from "./session-files.ts";
+import { checkpointEntryType, SessionFiles, type CheckpointEntryData, type SessionPosition } from "./session-files.ts";
 import { VersioningError } from "./errors.ts";
 import { isLanguagePreference, Language } from "./language.ts";
 import { Preferences } from "./preferences.ts";
 import { exportOutput } from "./tool-output.ts";
-import { diffView, showDiff, terminalText } from "./diff-view.ts";
+import { diffCommandName, diffView, roundDiffArgument, setRoundDiffPreview, showDiff, terminalText } from "./diff-view.ts";
 import { findWorkspaceRoot, isSearchDepth, workspaceRoot, type repositoryCoverage } from "./repositories.ts";
 
 function position(ctx: ExtensionContext): SessionPosition {
@@ -55,12 +55,24 @@ export default async function treeVersioning(pi: ExtensionAPI) {
   try { await preferences.load(); } catch (error) { preferenceError = error; }
   let pendingRestoreChanges = 0;
   const restorationEnabled = () => preferences.restoreEnabled && pendingRestoreChanges === 0;
+  let previewGeneration = 0;
+  const isCurrentLeaf = (ctx: ExtensionContext, leafId: string | null) =>
+    active && ctx.sessionManager.getLeafId() === leafId;
+  const refreshRoundPreview = async (ctx: ExtensionContext, leafId = ctx.sessionManager.getLeafId()) => {
+    if (ctx.mode !== "tui" || !isCurrentLeaf(ctx, leafId)) return;
+    const generation = ++previewGeneration;
+    const preview = await files.roundDiffPreview(position(ctx));
+    if (isCurrentLeaf(ctx, leafId) && generation === previewGeneration) setRoundDiffPreview(ctx, language, preview);
+  };
 
-  const registerDiffCommand = () => pi.registerCommand("tree-versioning-diff", {
+  const diffCommandUsage = { command: `/${diffCommandName}`, round: roundDiffArgument };
+  const registerDiffCommand = () => pi.registerCommand(diffCommandName, {
     description: language.message("diffCommand"),
     handler: async (args, ctx) => {
-      if (args.trim()) {
-        notify(ctx, language.message("diffHelp"), "info");
+      const argument = args.trim();
+      const round = argument === roundDiffArgument;
+      if (argument && !round) {
+        notify(ctx, language.message("diffHelp", diffCommandUsage), "info");
         return;
       }
       if (isFileVersioningSkipped(ctx)) {
@@ -83,8 +95,18 @@ export default async function treeVersioning(pi: ExtensionAPI) {
         return;
       }
       try {
-        const comparison = await files.diff(position(ctx), { scope: "session" });
-        await showDiff(comparison, language, ctx);
+        const selected = position(ctx);
+        const preview = round ? await files.roundDiffPreview(selected) : undefined;
+        if (round && !preview) {
+          notify(ctx, language.message("roundDiffNoPreview", diffCommandUsage), "info");
+          return;
+        }
+        const comparison = preview ? preview.diff : await files.diff(selected, { scope: "session" });
+        if (!isCurrentLeaf(ctx, selected.leafId)) return;
+        previewGeneration++;
+        setRoundDiffPreview(ctx, language);
+        try { await showDiff(comparison, language, ctx); }
+        finally { await refreshRoundPreview(ctx, selected.leafId); }
       } catch (error) {
         const reason = error instanceof VersioningError ? language.message(error.code) : language.message("query_failed") + " " + String(error);
         notify(ctx, reason, "error");
@@ -154,14 +176,14 @@ export default async function treeVersioning(pi: ExtensionAPI) {
     },
   });
   registerLanguageCommand();
-  pi.registerEntryRenderer<{ diff?: unknown }>("tree-versioning.checkpoint", (entry, options, theme) =>
+  pi.registerEntryRenderer<CheckpointEntryData>(checkpointEntryType, (entry, options, theme) =>
     diffView(entry.data?.diff, language, options, theme));
   pi.on("session_start", async (event, ctx) => {
     if (ctx.mode === "tui") {
       ctx.ui.addAutocompleteProvider(current => {
         const descriptions = ([
           { name: "tree-versioning-language", key: "languageCommand" },
-          { name: "tree-versioning-diff", key: "diffCommand" },
+          { name: diffCommandName, key: "diffCommand" },
           { name: "tree-versioning-restore", key: "restoreCommand" },
           { name: "tree-versioning-repository-depth", key: "repositoryDepthCommand" },
         ] as const).map(({ name, key }) => ({ name, key, cached: language.message(key) }));
@@ -212,6 +234,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
       reportError(ctx, event.reason === "fork" ? language.message("inheritanceFailed") + " " + reason : language.message("startupFailed", { reason }));
     }
     if (restoreFork) await restore(position(ctx), ctx);
+    await refreshRoundPreview(ctx);
     // Report optional preference failures only after independent file-history initialization.
     if (preferenceError && !ctx.hasUI) throw new Error(language.message("preferences_failed") + " " + String(preferenceError));
   });
@@ -225,7 +248,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
         throw new VersioningError("storage_failed", "Session left the settled node ancestry during checkpoint collection.");
       }
       // One publication keeps the association and its display on the same native branch.
-      pi.appendEntry("tree-versioning.checkpoint", { ...checkpoint, diff: comparison });
+      pi.appendEntry(checkpointEntryType, { ...checkpoint, diff: comparison });
     } catch (error) {
       const reason = error instanceof VersioningError ? language.message(error.code) : String(error);
       reportError(ctx, language.message("checkpointFailed", { reason }));
@@ -261,6 +284,10 @@ export default async function treeVersioning(pi: ExtensionAPI) {
   };
   pi.on("session_tree", async (event, ctx) => {
     if (event.newLeafId !== event.oldLeafId) await restore({ ...position(ctx), leafId: event.newLeafId }, ctx);
+  });
+  pi.on("session_tree", async (event, ctx) => {
+    // Never append a card to the native branch just to display an existing one.
+    if (event.newLeafId !== event.oldLeafId) await refreshRoundPreview(ctx, event.newLeafId);
   });
 
   const queryError = async (error: unknown) => {

@@ -1,4 +1,4 @@
-import type { SessionEntry, SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
+import type { CustomEntry, SessionEntry, SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { isUtf8 } from "node:buffer";
 import { accessSync, constants, lstatSync, mkdirSync, readdirSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
@@ -47,6 +47,26 @@ interface ComparisonRequest { scope?: string; checkpointId?: string; files?: str
 export type RecordedDiff = Awaited<ReturnType<SessionFiles["diff"]>> | {
   status: "error"; checkpointId: string; code: ErrorCode;
 };
+export const checkpointEntryType = "tree-versioning.checkpoint";
+export type CheckpointEntryData = Checkpoint & { diff?: unknown };
+export interface RoundDiffPreview { nodeId: string; diff: unknown };
+
+function unavailableRoundDiff(checkpointId: string, error: unknown): RecordedDiff {
+  return { status: "error", checkpointId, code: error instanceof VersioningError ? error.code : "query_failed" };
+}
+
+function savedRoundEndpoint(data: CheckpointEntryData | undefined) {
+  const diff = data?.diff as Partial<RecordedDiff> | undefined;
+  if (diff?.status === "ok" && diff.scope === "turn" && diff.to?.kind === "checkpoint" && isCheckpoint(diff.to) &&
+      diff.to.id === data?.id && diff.to.capturedAt === data.capturedAt) return diff.to;
+}
+
+function savedRoundDiff(data: CheckpointEntryData): unknown {
+  const diff = data.diff as Partial<RecordedDiff> | undefined;
+  if (diff?.status === "error") return diff.checkpointId === data.id ? data.diff : undefined;
+  // A copied card retains its original endpoint, even if inheritance rebound the native node.
+  if (savedRoundEndpoint(data)?.nodeId === data.nodeId) return data.diff;
+}
 
 type FileState = { kind: "file"; content: string; executable: boolean } |
   { kind: "symlink"; target: string; targetEncoding: "utf8" | "base64" };
@@ -267,6 +287,7 @@ function applySnapshot(root: string, current: Record<string, FileState>, target:
 /** Owns file collection, persistence, history coverage, comparisons, restoration, and inheritance. */
 export class SessionFiles {
   private forkAttempt?: ForkAttempt;
+  private inherited?: { sessionId: string; checkpoints: readonly Checkpoint[] };
 
   constructor(private readonly storageDir: string) {}
 
@@ -404,6 +425,7 @@ export class SessionFiles {
   }
 
   async initialize(position: SessionPosition, event: SessionStartEvent, searchDepth: (root: string) => number = () => 0) {
+    this.inherited = undefined;
     const handoff = this.claimForkHandoff(position, event);
     const fork = event.reason === "fork" && handoff?.kind !== "no-history";
     const ephemeral = handoff?.kind === "ephemeral" ? handoff.transfer : undefined;
@@ -430,6 +452,7 @@ export class SessionFiles {
     const restore = fork && inheritance?.restoreAfterFork === true;
     try {
       const existing = await this.load(position);
+      if (existing.inheritedCheckpoints?.length) this.inherited = { sessionId: position.sessionId, checkpoints: existing.inheritedCheckpoints };
       return { baseline: existing.baseline, coverage: repositoryCoverage(existing.repositoryScope), created: !existing.inheritedCheckpoints && !fork && !this.hasBaselineRecord(position), workspaceRoot: root, restore };
     } catch (error) {
       if (!(error instanceof VersioningError) || error.code !== "no_baseline") throw error;
@@ -583,7 +606,7 @@ export class SessionFiles {
         return undefined;
       });
       const recordedHistory = position.entries.some(entry => entry.type === "custom" &&
-        (entry.customType === "tree-versioning.baseline" || entry.customType === "tree-versioning.checkpoint"));
+        (entry.customType === "tree-versioning.baseline" || entry.customType === checkpointEntryType));
       const missing = (error as NodeJS.ErrnoException).code === "ENOENT" && !recordedHistory && !inherited;
       const pending = missing && (position.sessionFile ? await this.receiptPath(position.sessionFile) : this.pendingEphemeralFork(position));
       throw new VersioningError(
@@ -630,29 +653,77 @@ export class SessionFiles {
     } catch (error) {
       throw new VersioningError("storage_failed", String(error));
     }
-    let comparison: RecordedDiff;
-    try { comparison = await this.compare(position, { scope: "turn" }, snapshot); }
-    catch (error) {
-      comparison = { status: "error", checkpointId: checkpoint.id,
-        code: error instanceof VersioningError ? error.code : "query_failed" };
-    }
+    const comparison = await this.compare(position, { scope: "turn" }, snapshot)
+      .catch(error => unavailableRoundDiff(checkpoint.id, error));
     return { checkpoint, comparison };
+  }
+
+  // Only an exact-node filter can skip an entry. A damaged match is an error.
+  private checkpointAssociation(position: SessionPosition, entry: CustomEntry, inherited: ReadonlyMap<string, Checkpoint>,
+    exactNodeId?: string) {
+    const data = entry.data as CheckpointEntryData | undefined;
+    const rebound = typeof data?.id === "string" ? inherited.get(data.id) : undefined;
+    if (exactNodeId !== undefined && exactNodeId !== (rebound?.nodeId ?? data?.nodeId)) return undefined;
+    if (isCheckpoint(data)) {
+      const record = rebound ?? data;
+      // Copied cards are left intact; the child can bind a removed label to the card itself.
+      if (record.capturedAt === data.capturedAt && (rebound?.nodeId === entry.id ||
+          entry.parentId !== null && this.branchAt(position, entry.parentId).includes(record.nodeId))) {
+        return { record, data };
+      }
+    }
+    throw new VersioningError("snapshot_unavailable", "Invalid checkpoint association.");
+  }
+
+  async roundDiffPreview(position: SessionPosition): Promise<RoundDiffPreview | undefined> {
+    const { entries, leafId } = position;
+    if (leafId === null) return undefined;
+    const inherited = this.inherited?.sessionId === position.sessionId ? this.inherited.checkpoints : [];
+    const byId = new Map(inherited.map(record => [record.id, record]));
+    const detachedEndpoints: Checkpoint[] = [];
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const entry = entries[index];
+      if (entry.type !== "custom" || entry.customType !== checkpointEntryType) continue;
+      let diff: unknown;
+      try {
+        const association = this.checkpointAssociation(position, entry, byId, leafId);
+        if (!association) {
+          // The saved endpoint can diagnose a broken association, never retarget the patch.
+          const endpoint = savedRoundEndpoint(entry.data as CheckpointEntryData | undefined);
+          if (endpoint?.nodeId === leafId && !byId.has(endpoint.id)) detachedEndpoints.push(endpoint);
+          continue;
+        }
+        diff = savedRoundDiff(association.data);
+      } catch (error) {
+        if (!(error instanceof VersioningError)) throw error;
+      }
+      // A checkpoint rebound to its own card is already visible.
+      return entry.id === leafId ? undefined : { nodeId: leafId, diff };
+    }
+    // A native copy ending at the checkpoint may have inherited its snapshots but not the card that followed it.
+    const checkpoint = this.nearestCheckpoint(inherited, [leafId]);
+    if (checkpoint) {
+      const diff = await this.compare(position, { scope: "turn", checkpointId: checkpoint.id })
+        .catch(error => unavailableRoundDiff(checkpoint.id, error));
+      return { nodeId: leafId, diff };
+    }
+    if (detachedEndpoints.length) {
+      // An independently saved snapshot must corroborate the detached endpoint.
+      const baseline = await this.readBaseline(position).catch(() => undefined);
+      if (!baseline) return undefined;
+      for (const endpoint of detachedEndpoints) {
+        const snapshot = await this.loadCheckpoint(position, endpoint, baseline.workspaceRoot, baseline.repositoryScope)
+          .catch(() => undefined);
+        if (snapshot) return { nodeId: leafId, diff: undefined };
+      }
+    }
   }
 
   private checkpointRecords(position: SessionPosition, baseline: Snapshot): Checkpoint[] {
     const inherited = new Map((baseline.inheritedCheckpoints ?? []).map(record => [record.id, record]));
-    const records = position.entries.filter(entry => entry.type === "custom" && entry.customType === "tree-versioning.checkpoint").map(entry => {
-      const data = entry.type === "custom" ? entry.data : undefined;
-      if (!isCheckpoint(data)) throw new VersioningError("snapshot_unavailable", "Invalid checkpoint association.");
-      // Keep copied semantic entries intact; the child manifest owns rebinding of
-      // native label IDs that the host removed and recreated during copying.
-      const record = inherited.get(data.id) ?? data;
-      if (record.capturedAt !== data.capturedAt || !(inherited.has(data.id) && record.nodeId === entry.id ||
-          entry.parentId !== null && this.branchAt(position, entry.parentId).includes(record.nodeId))) {
-        throw new VersioningError("snapshot_unavailable", "Invalid checkpoint association.");
-      }
-      return record;
-    });
+    const records = position.entries.filter((entry): entry is CustomEntry =>
+      entry.type === "custom" && entry.customType === checkpointEntryType)
+      .map(entry => this.checkpointAssociation(position, entry, inherited)!.record);
     const merged = new Map(records.map(record => [record.id, record]));
     for (const record of baseline.inheritedCheckpoints ?? []) {
       const existing = merged.get(record.id);

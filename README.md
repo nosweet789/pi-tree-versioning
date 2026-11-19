@@ -53,6 +53,8 @@ If a session starts outside a Git working tree and has no saved file history, th
 
 Each checkpoint adds a card with changed files and addition/deletion counts. Bold paths and themed diff colors distinguish the file summary, additions, deletions, and context; status text and `+`/`-` markers remain visible. Use pi's **expand tool output** action, **Ctrl+O** by default, to inspect text patches. Binary files show change summaries. An unchanged round still gets a checkpoint and an empty-diff card.
 
+When native `/tree` lands on a checkpoint whose saved card isn't on the current branch, a round diff preview appears above the editor, even with file restoration off. Use the same tool-output toggle to expand it. If the diff doesn't fit, `/tree-versioning-diff round` opens the full comparison in the scrollable viewer. Widen the terminal if the preview can't show the whole command.
+
 To view the current branch's saved total diff:
 
 ```text
