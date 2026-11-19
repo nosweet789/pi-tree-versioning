@@ -12,7 +12,7 @@ test("the existing terminal completion provider updates command help immediately
   const cached = new CombinedAutocompleteProvider([
     { name: "tree-versioning-language", description: "[extension] Choose the tree-versioning language" },
     { name: "tree-versioning-diff", description: "[extension] View the current branch's saved session diff" },
-    { name: "tree-versioning-restore", description: "[extension] Control automatic file restoration" },
+    { name: "tree-versioning-restore", description: "[extension] " + en.restoreCommand },
   ], testWorkspace.cwd);
   const app = await load(testWorkspace, undefined, { autocomplete: cached });
   try {
@@ -29,12 +29,12 @@ test("the existing terminal completion provider updates command help immediately
     assert.match((await suggestions())!.items[0].description!, /^\[extension\] .*语言/);
     assert.equal((await suggestions())!.items[0].value, "tree-versioning-language");
     assert.match((await diffSuggestions())!.items[0].description!, /会话总差异/);
-    assert.match((await restoreSuggestions())!.items[0].description!, /自动恢复文件/);
-    assert.match(app.session.extensionRunner.getCommand("tree-versioning-restore")!.description!, /自动恢复文件/);
+    assert.match((await restoreSuggestions())!.items[0].description!, /here 恢复当前落点/);
+    assert.match(app.session.extensionRunner.getCommand("tree-versioning-restore")!.description!, /here 恢复当前落点/);
     await app.command("en");
     assert.match((await suggestions())!.items[0].description!, /Choose/);
     assert.match((await diffSuggestions())!.items[0].description!, /saved session diff/);
-    assert.match((await restoreSuggestions())!.items[0].description!, /automatic file restoration/);
+    assert.match((await restoreSuggestions())!.items[0].description!, /restore the current position with here/);
   } finally { dispose(app.session); }
 });
 

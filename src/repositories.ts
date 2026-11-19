@@ -1,5 +1,6 @@
 import { isUtf8 } from "node:buffer";
-import { execFile } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
+import { lstatSync, realpathSync, type Stats } from "node:fs";
 import { lstat, opendir, realpath } from "node:fs/promises";
 import { basename, delimiter, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { promisify } from "node:util";
@@ -34,15 +35,24 @@ export function validPath(path: string): boolean {
 }
 
 
-async function git(cwd: string, args: string[], { input, locale }: { input?: string; locale?: string } = {}): Promise<string> {
+function gitOptions(locale?: string) {
   const environment: NodeJS.ProcessEnv = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
   if (locale) environment.LC_ALL = locale;
   for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"]) {
     delete environment[key];
   }
-  const command = exec("git", ["-C", cwd, ...args], {
-    env: environment, encoding: "buffer", maxBuffer: 64 * 1024 * 1024, timeout: 30_000,
-  });
+  return { env: environment, encoding: "buffer" as const, maxBuffer: 64 * 1024 * 1024, timeout: 30_000 };
+}
+
+function decodeGitOutput(stdout: Buffer, stderr: Buffer) {
+  // Git may exit successfully while warning that unreadable directories were skipped.
+  if (stderr.length) throw new Error("Git reported a diagnostic: " + String(stderr));
+  if (!isUtf8(stdout)) throw new Error("Git returned paths that are not valid UTF-8");
+  return stdout.toString("utf8");
+}
+
+async function git(cwd: string, args: string[], { input, locale }: { input?: string; locale?: string } = {}): Promise<string> {
+  const command = exec("git", ["-C", cwd, ...args], gitOptions(locale));
   const inputComplete = input === undefined ? Promise.resolve() : new Promise<void>((resolve, reject) => {
     const stream = command.child.stdin!;
     stream.on("error", reject);
@@ -52,10 +62,7 @@ async function git(cwd: string, args: string[], { input, locale }: { input?: str
     if (args[0] === "check-ignore" && error.code === 1) return { stdout: Buffer.alloc(0), stderr: error.stderr ?? Buffer.alloc(0) };
     throw error;
   }), inputComplete]);
-  // Git may exit successfully while warning that unreadable directories were skipped.
-  if (stderr.length) throw new Error("Git reported a diagnostic: " + String(stderr));
-  if (!isUtf8(stdout)) throw new Error("Git returned paths that are not valid UTF-8");
-  return stdout.toString("utf8");
+  return decodeGitOutput(stdout, stderr);
 }
 
 export async function workspaceRoot(cwd: string): Promise<string> {
@@ -146,18 +153,52 @@ async function assertDirectory(root: string, path: string) {
   }
 }
 
+function matchesDirectory(stat: Stats, expected: Pick<Stats, "dev" | "ino">) {
+  return stat.isDirectory() && stat.dev === expected.dev && stat.ino === expected.ino;
+}
+
+function verifyGitDirectory(identity: RepositoryIdentity, stat: Stats) {
+  if (!matchesDirectory(stat, { dev: identity.device, ino: identity.inode })) {
+    throw new Error("Repository disappeared or changed during collection: " + identity.path);
+  }
+}
+
+type AdministrativePathFlag = "--absolute-git-dir" | "--git-common-dir";
+const administrativePathArgs = (flag: AdministrativePathFlag) => ["rev-parse", "--path-format=absolute", flag];
+
+function liveAdministrativePath(directory: string, flag: AdministrativePathFlag) {
+  // Resolve redirects using Git's own rules. Keep this last read bounded because
+  // it runs synchronously in the write window rather than during collection.
+  const { error, status, stdout, stderr } = spawnSync("git", ["-C", directory, ...administrativePathArgs(flag)], {
+    ...gitOptions(), timeout: 5_000, killSignal: "SIGKILL",
+  });
+  if (error) throw error;
+  if (status !== 0) throw new Error("Git could not resolve the repository layout before restoration: " + directory);
+  return realpathSync.native(decodeGitOutput(stdout, stderr).replace(/\r?\n$/, ""));
+}
+
 async function repository(root: string, path: string) {
   await assertDirectory(root, path);
   const directory = join(root, path);
-  const marker = await lstat(join(directory, ".git"));
+  const markerPath = join(directory, ".git");
+  const marker = await lstat(markerPath);
   if (path !== "." && !marker.isDirectory()) throw new Error("Nested repository is no longer an ordinary repository: " + path);
   if (await workspaceRoot(directory) !== directory) throw new Error("Repository root changed: " + path);
-  const [gitDirectory, commonDirectory] = await Promise.all(["--absolute-git-dir", "--git-common-dir"].map(async flag =>
-    realpath((await git(directory, ["rev-parse", "--path-format=absolute", flag])).replace(/\r?\n$/, ""))));
+  const administrativePath = async (flag: AdministrativePathFlag) =>
+    realpath((await git(directory, administrativePathArgs(flag))).replace(/\r?\n$/, ""));
+  const gitDirectory = await administrativePath("--absolute-git-dir");
+  const commonMarkerPath = join(gitDirectory, "commondir");
+  const commonMarker = await statIfPresent(commonMarkerPath);
+  const commonDirectory = await administrativePath("--git-common-dir");
+  const layoutBindings = [
+    { path: markerPath, stat: marker, flag: "--absolute-git-dir", resolved: gitDirectory },
+    { path: commonMarkerPath, stat: commonMarker, flag: "--git-common-dir", resolved: commonDirectory },
+  ] as const;
   if (path !== "." && (gitDirectory !== join(directory, ".git") || commonDirectory !== gitDirectory)) {
     throw new Error("Nested worktrees and redirected Git directories are not supported: " + path);
   }
   const administrative = await lstat(gitDirectory);
+  const commonIdentity = commonDirectory === gitDirectory ? undefined : await lstat(commonDirectory);
   const identity: RepositoryIdentity = {
     path, gitDirectory, commonDirectory, device: administrative.dev, inode: administrative.ino,
   };
@@ -171,7 +212,7 @@ async function repository(root: string, path: string) {
     if (record.startsWith("160000 ")) excluded.push(join(directory, file));
     else { paths.add(file); trackedPaths.add(file); }
   }
-  return { identity, directory, paths, trackedPaths, excluded };
+  return { identity, directory, paths, trackedPaths, excluded, layoutBindings, commonIdentity };
 }
 
 /** Discover only at baseline creation. Later reads validate the saved coverage instead. */
@@ -334,11 +375,26 @@ export async function workspaceScope(root: string, saved?: RepositoryScope) {
       }
     },
     async verify() {
-      for (const item of repositories) {
-        await assertDirectory(root, item.identity.path);
-        const stat = await lstat(item.identity.gitDirectory);
-        if (!stat.isDirectory() || stat.dev !== item.identity.device || stat.ino !== item.identity.inode) {
-          throw new Error("Repository disappeared or changed during collection: " + item.identity.path);
+      for (const { identity } of repositories) {
+        await assertDirectory(root, identity.path);
+        verifyGitDirectory(identity, await lstat(identity.gitDirectory));
+      }
+    },
+    verifyBeforeWrite() {
+      // Join the synchronous restore window after the caller's final Git lookup.
+      for (const { directory, identity, layoutBindings, commonIdentity } of repositories) {
+        if (realpathSync.native(directory) !== directory) throw new Error("Repository path changed before restoration: " + identity.path);
+        for (const { path, stat, flag, resolved } of layoutBindings) {
+          const current = lstatSync(path, { throwIfNoEntry: false });
+          if (stat?.dev !== current?.dev || stat?.ino !== current?.ino ||
+              (stat && !stat.isDirectory() && (stat.ctimeMs !== current?.ctimeMs || stat.size !== current?.size ||
+                liveAdministrativePath(directory, flag) !== resolved))) {
+            throw new Error("Repository layout changed before restoration: " + identity.path);
+          }
+        }
+        verifyGitDirectory(identity, lstatSync(identity.gitDirectory));
+        if (commonIdentity && !matchesDirectory(lstatSync(identity.commonDirectory), commonIdentity)) {
+          throw new Error("Common Git directory changed before restoration: " + identity.path);
         }
       }
     },

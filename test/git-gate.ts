@@ -25,14 +25,18 @@ process.exitCode = status ?? spawnSync("git", args, {
   };
 }
 
-/** Pause one real Git scan, leaving subsequent host operations free to proceed. */
-export async function pauseGitScan(workspace: Fixture) {
+/** Pause one matching Git call, leaving subsequent host operations free to proceed. */
+export async function pauseGitScan(workspace: Fixture, match = ["ls-files"], skip = 0) {
   const started = join(workspace.root, "scan-started");
   const released = join(workspace.root, "scan-released");
   const restorePath = await interceptGit(workspace, `
 const { existsSync, mkdirSync } = require("node:fs");
 let paused = false;
-if (args.includes("ls-files")) {
+if (${JSON.stringify(match)}.every(argument => args.includes(argument))) {
+  for (let index = 0; index < ${skip}; index++) {
+    try { mkdirSync(${JSON.stringify(started)} + "-" + index); return; }
+    catch (error) { if (error.code !== "EEXIST") throw error; }
+  }
   try { mkdirSync(${JSON.stringify(started)}); paused = true; }
   catch (error) { if (error.code !== "EEXIST") throw error; }
 }

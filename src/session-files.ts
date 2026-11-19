@@ -1,6 +1,6 @@
 import type { CustomEntry, SessionEntry, SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { isUtf8 } from "node:buffer";
-import { accessSync, constants, lstatSync, mkdirSync, readdirSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, constants, lstatSync, mkdirSync, readdirSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync, type BigIntStats } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { link, lstat, mkdir, mkdtemp, open, readlink, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -94,6 +94,13 @@ interface Checkpoint {
 interface CheckpointSnapshot extends FileSnapshot {
   checkpoint: Checkpoint;
 }
+
+interface SnapshotFileStamp {
+  path: string;
+  stat: BigIntStats;
+}
+
+export type RestoreTarget = ReturnType<SessionFiles["checkpointEndpoint"] | SessionFiles["baselineEndpoint"]>;
 
 function isCheckpoint(value: unknown): value is Checkpoint {
   const checkpoint = value as Checkpoint | undefined;
@@ -309,13 +316,36 @@ export class SessionFiles {
     return path;
   }
 
-  private async readRegularFile(path: string) {
+  private async readRegularFile(path: string, stamps?: SnapshotFileStamp[]) {
     if (!(await lstat(path)).isFile()) throw new Error("Stored data is not a regular file");
     const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     try {
-      if (!(await handle.stat()).isFile()) throw new Error("Stored data is not a regular file");
-      return await handle.readFile("utf8");
+      const stat = await handle.stat({ bigint: true });
+      if (!stat.isFile()) throw new Error("Stored data is not a regular file");
+      const text = await handle.readFile("utf8");
+      stamps?.push({ path, stat });
+      return text;
     } finally { await handle.close(); }
+  }
+
+  // Snapshots are immutable. Check the files actually read, without loading a second
+  // copy of history or introducing another await between the final check and writes.
+  private assertSnapshotFilesStillMatch(stamps: SnapshotFileStamp[]) {
+    try {
+      for (const { path, stat } of stamps) {
+        if (!lstatSync(this.storageDir).isDirectory() || !lstatSync(dirname(path)).isDirectory()) {
+          throw new Error("Snapshot storage is no longer an ordinary directory.");
+        }
+        const current = lstatSync(path, { bigint: true });
+        if (!current.isFile() || current.dev !== stat.dev || current.ino !== stat.ino || current.size !== stat.size ||
+            current.ctimeNs !== stat.ctimeNs || current.mtimeNs !== stat.mtimeNs) {
+          throw new Error("The saved snapshot changed.");
+        }
+        accessSync(path, constants.R_OK);
+      }
+    } catch (error) {
+      throw new VersioningError("snapshot_unavailable", "The selected restore history is no longer available. " + String(error));
+    }
   }
 
   private async publishSnapshot(path: string, snapshot: FileSnapshot) {
@@ -595,11 +625,11 @@ export class SessionFiles {
     return directory;
   }
 
-  private async readBaseline(position: SessionPosition): Promise<Snapshot> {
+  private async readBaseline(position: SessionPosition, stamps?: SnapshotFileStamp[]): Promise<Snapshot> {
     let snapshot: Snapshot;
     try {
       const path = await this.storagePath(position.sessionId);
-      snapshot = parseSnapshot(await this.readRegularFile(path), "baseline");
+      snapshot = parseSnapshot(await this.readRegularFile(path, stamps), "baseline");
     } catch (error) {
       const inherited = await lstat(this.path(position.sessionId, "") + ".origin.json").catch(error => {
         if (error.code !== "ENOENT") throw error;
@@ -620,11 +650,15 @@ export class SessionFiles {
     return snapshot;
   }
 
-  private async load(position: SessionPosition): Promise<Snapshot> {
-    const snapshot = await this.readBaseline(position);
-    if (snapshot.workspaceRoot !== await workspaceRoot(position.cwd)) {
+  private async assertWorkspace(position: SessionPosition, root: string) {
+    if (root !== await workspaceRoot(position.cwd)) {
       throw new VersioningError("workspace_mismatch", "Snapshot session or workspace identity does not match.");
     }
+  }
+
+  private async load(position: SessionPosition, stamps?: SnapshotFileStamp[]): Promise<Snapshot> {
+    const snapshot = await this.readBaseline(position, stamps);
+    await this.assertWorkspace(position, snapshot.workspaceRoot);
     return snapshot;
   }
 
@@ -736,10 +770,10 @@ export class SessionFiles {
     return [...merged.values()];
   }
 
-  private async loadCheckpoint(position: SessionPosition, checkpoint: Checkpoint, root: string, scope?: RepositoryScope) {
+  private async loadCheckpoint(position: SessionPosition, checkpoint: Checkpoint, root: string, scope?: RepositoryScope, stamps?: SnapshotFileStamp[]) {
     try {
       const path = await this.storagePath(position.sessionId, false, "checkpoint-" + checkpoint.id + ".json");
-      const snapshot = parseSnapshot(await this.readRegularFile(path), "checkpoint");
+      const snapshot = parseSnapshot(await this.readRegularFile(path, stamps), "checkpoint");
       if (snapshot.sessionId !== position.sessionId || snapshot.workspaceRoot !== root ||
           snapshot.checkpoint.id !== checkpoint.id || snapshot.checkpoint.nodeId !== checkpoint.nodeId ||
           snapshot.checkpoint.capturedAt !== checkpoint.capturedAt ||
@@ -808,27 +842,45 @@ export class SessionFiles {
     return branch.reverse();
   }
 
-  async restore(position: SessionPosition, stillCurrent: () => boolean) {
-    const baseline = await this.load(position);
+  async restore(position: SessionPosition, stillCurrent: () => boolean,
+    confirm?: (target: RestoreTarget) => Promise<boolean>): Promise<RestoreTarget | undefined> {
+    const stamps: SnapshotFileStamp[] | undefined = confirm ? [] : undefined;
+    const assertReady = () => {
+      if (!stillCurrent()) throw new VersioningError("restore_superseded", "The restore destination is no longer current.");
+      if (stamps) this.assertSnapshotFilesStillMatch(stamps);
+    };
+    const baseline = await this.load(position, stamps);
     await this.assertExternalPersistence(position, baseline.workspaceRoot);
     const branch = this.branchAt(position, position.leafId);
     const checkpoint = this.nearestCheckpoint(this.checkpointRecords(position, baseline), branch);
     if (!checkpoint && !this.baselineCovers(baseline, branch)) {
       throw new VersioningError("no_baseline", "No saved file history covers the navigation destination.");
     }
-    const snapshot = checkpoint ? await this.loadCheckpoint(position, checkpoint, baseline.workspaceRoot, baseline.repositoryScope) : baseline;
+    const snapshot = checkpoint ? await this.loadCheckpoint(position, checkpoint, baseline.workspaceRoot, baseline.repositoryScope, stamps) : baseline;
+    const target = checkpoint ? this.checkpointEndpoint(snapshot as CheckpointSnapshot) : this.baselineEndpoint(baseline);
+    if (confirm) {
+      assertReady();
+      if (await confirm(target) !== true) return;
+      assertReady();
+    }
     const root = snapshot.workspaceRoot;
     try {
       const scope = await workspaceScope(root, snapshot.repositoryScope);
       await scope.assertRestorable(Object.keys(snapshot.files));
       const current = await collect(root, scope);
-      if (!stillCurrent()) throw new VersioningError("restore_superseded", "The restore destination is no longer current.");
+      if (confirm) {
+        // The working directory and storage location must still match after the dialog.
+        await this.assertExternalPersistence(position, root);
+        await this.assertWorkspace(position, root);
+        scope.verifyBeforeWrite();
+      }
+      assertReady();
       applySnapshot(root, current, snapshot.files);
     } catch (error) {
       if (error instanceof VersioningError) throw error;
       throw new VersioningError("restore_failed", String(error));
     }
-    return checkpoint ? this.checkpointEndpoint(snapshot as CheckpointSnapshot) : this.baselineEndpoint(baseline);
+    return target;
   }
 
   async diff(position: SessionPosition, request: ComparisonRequest = {}) {

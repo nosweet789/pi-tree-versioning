@@ -34,9 +34,11 @@ export type Fixture = Awaited<ReturnType<typeof fixture>>;
 interface LoadOptions {
   autocomplete?: AutocompleteProvider;
   extensionFactories?: ExtensionFactory[];
+  leadingExtensions?: string[];
   sessionStartEvent?: SessionStartEvent;
   mode?: "tui" | "rpc" | "json" | "print";
   expectedStartupErrors?: number;
+  confirm?: ExtensionUIContext["confirm"];
   custom?: ExtensionUIContext["custom"];
 }
 
@@ -49,7 +51,7 @@ export async function load(testWorkspace: Fixture, manager = SessionManager.crea
   });
   const resourceLoader = new DefaultResourceLoader({
     cwd: testWorkspace.cwd, agentDir: testWorkspace.agentDir, settingsManager,
-    additionalExtensionPaths: [process.env.TREE_VERSIONING_TEST_PACKAGE ?? resolve("src/index.ts")], extensionFactories,
+    additionalExtensionPaths: [...(options.leadingExtensions ?? []), process.env.TREE_VERSIONING_TEST_PACKAGE ?? resolve("src/index.ts")], extensionFactories,
     noExtensions: true, noSkills: true, noThemes: true, noPromptTemplates: true, noContextFiles: true,
   });
   await resourceLoader.reload();
@@ -75,6 +77,7 @@ export async function load(testWorkspace: Fixture, manager = SessionManager.crea
   const ui = {
     ...session.extensionRunner.getUIContext(),
     notify(message: string, type?: string) { notices.push({ message, type }); },
+    ...(options.confirm ? { confirm: options.confirm } : {}),
     ...(options.custom ? { custom: options.custom } : {}),
     addAutocompleteProvider(factory) { if (autocomplete) autocomplete = factory(autocomplete); },
   } satisfies ExtensionUIContext;

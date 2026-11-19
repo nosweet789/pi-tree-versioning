@@ -51,11 +51,16 @@ test("legacy language-only preferences default restoration to on and status or h
   try {
     const command = app.session.extensionRunner.getCommand("tree-versioning-restore")!;
     assert.deepEqual(await command.getArgumentCompletions!("of"), [{ value: "off", label: "off" }]);
+    const [here] = (await command.getArgumentCompletions!("he"))!;
+    assert.equal(here.value, "here");
+    assert.match(here.description ?? "", /覆盖.*删除/);
     const entries = app.manager.getEntries();
-    for (const args of ["", "help", "invalid", "off extra"]) {
+    for (const args of ["", "help", "invalid", "off extra", "here extra"]) {
       await app.session.prompt("/tree-versioning-restore " + args);
-      assert.match(app.notices.at(-1)!.message, /文件恢复：开启/);
-      assert.match(app.notices.at(-1)!.message, /on \| off/);
+      const { message } = app.notices.at(-1)!;
+      assert.match(message, /文件恢复：开启/);
+      assert.match(message, /on \| off \| here/);
+      assert.match(message, /未入快照.*可能被覆盖.*新文件可能被删除/);
     }
     assert.deepEqual((await app.query("tree_versioning_status")).structuredContent, { restoreEnabled: true });
     assert.equal(await readFile(path, "utf8"), original);

@@ -51,7 +51,7 @@ async function inspectLoaded(workspace: Fixture, args: string[] = [], language =
     assert.match(command.description!, language === "en" ? /saved session diff/ : /会话总差异/);
     const restoreCommand = commands.find(value => value.name === "tree-versioning-restore");
     assert.ok(restoreCommand, "The installed package must register its restoration command");
-    assert.match(restoreCommand.description!, language === "en" ? /automatic file restoration/ : /自动恢复文件/);
+    assert.match(restoreCommand.description!, language === "en" ? /restore the current position with here/ : /here 恢复当前落点/);
     const depthCommand = commands.find(value => value.name === "tree-versioning-repository-depth");
     assert.ok(depthCommand, "The installed package must register its repository depth command");
     assert.match(depthCommand.description!, language === "en" ? /repository search depth/ : /仓库搜索深度/);

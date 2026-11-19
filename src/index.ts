@@ -2,7 +2,8 @@ import { getAgentDir, truncateHead, type ExtensionAPI, type ExtensionContext } f
 import { join } from "node:path";
 import { checkpointsOutput, checkpointsParameters, diffOutput, diffParameters, statusOutput, statusParameters } from "./tool-contract.ts";
 export type { CheckpointsInput, DiffInput, StatusInput } from "./tool-contract.ts";
-import { checkpointEntryType, SessionFiles, type CheckpointEntryData, type SessionPosition } from "./session-files.ts";
+import { checkpointEntryType, SessionFiles, type CheckpointEntryData, type RestoreTarget, type SessionPosition } from "./session-files.ts";
+import { confirmFileRestore } from "./restore-confirmation.ts";
 import { VersioningError } from "./errors.ts";
 import { isLanguagePreference, Language } from "./language.ts";
 import { Preferences } from "./preferences.ts";
@@ -36,6 +37,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
   const isFileVersioningSkipped = (ctx: ExtensionContext) => ctx.sessionManager.getSessionId() === skippedSessionId;
   let activeWorkspace: { root: string; coverage: ReturnType<typeof repositoryCoverage> } | undefined;
   let restoreGeneration = 0;
+  let hereGeneration = 0;
   let active = true;
   pi.on("session_before_fork", async (event, ctx) => {
     try { await files.prepareFork(position(ctx), event.entryId, event.position); }
@@ -49,6 +51,9 @@ export default async function treeVersioning(pi: ExtensionAPI) {
     catch { reportError(ctx, language.message("inheritanceFailed")); }
   });
   pi.on("before_agent_start", () => { restoreGeneration++; });
+  // Invalidate manual consent before Pi can move, even if earlier extensions
+  // delay the post-navigation event until after the leaf returns to this spot.
+  pi.on("session_before_tree", () => { hereGeneration++; });
   const preferences = new Preferences(join(storage, "preferences.json"));
   const language = new Language(() => preferences.language);
   let preferenceError: unknown;
@@ -116,11 +121,17 @@ export default async function treeVersioning(pi: ExtensionAPI) {
   registerDiffCommand();
   const registerRestoreCommand = () => pi.registerCommand("tree-versioning-restore", {
     description: language.message("restoreCommand"),
-    getArgumentCompletions: prefix => ["on", "off"].filter(value => value.startsWith(prefix)).map(value => ({ value, label: value })),
+    getArgumentCompletions: prefix => ["on", "off", "here"].filter(value => value.startsWith(prefix))
+      .map(value => value === "here" ? { value, label: value, description: language.message("restoreHereCompletion") } : { value, label: value }),
     handler: async (args, ctx) => {
       const choice = args.trim();
+      if (choice === "here") {
+        await restore(position(ctx), ctx, "here");
+        return;
+      }
       if (choice !== "on" && choice !== "off") {
-        notify(ctx, language.message("restoreHelp", { state: language.message(restorationEnabled() ? "restoreOn" : "restoreOff") }), "info");
+        notify(ctx, language.message("restoreHelp", { state: language.message(restorationEnabled() ? "restoreOn" : "restoreOff") }) +
+          " " + language.message("restoreHereRisk"), "info");
         return;
       }
       restoreGeneration++;
@@ -259,21 +270,59 @@ export default async function treeVersioning(pi: ExtensionAPI) {
     }
   });
 
-  const restore = async (destination: SessionPosition, ctx: ExtensionContext) => {
-    if (isFileVersioningSkipped(ctx) || !restorationEnabled()) return;
-    const generation = ++restoreGeneration;
+  const restore = async (destination: SessionPosition, ctx: ExtensionContext, mode: "native" | "here" = "native") => {
+    const here = mode === "here";
+    if (!here && isFileVersioningSkipped(ctx)) return;
+    if (!restorationEnabled()) {
+      if (here) reportError(ctx, language.message("restoreDisabled"));
+      return;
+    }
+    if (here && !ctx.hasUI) {
+      reportError(ctx, language.message("restoreConfirmationUnavailable"));
+      return;
+    }
+    // An unconfirmed request must not cancel an in-flight native restore.
+    const hereRequest = here ? ++hereGeneration : undefined;
+    let generation = here ? restoreGeneration : ++restoreGeneration;
+    const stillCurrent = () => {
+      if (!active || !restorationEnabled() || generation !== restoreGeneration || !ctx.isIdle()) return false;
+      if (here) return hereRequest === hereGeneration && ctx.sessionManager.getSessionId() === destination.sessionId &&
+        ctx.sessionManager.getLeafId() === destination.leafId;
+      const branch = ctx.sessionManager.getBranch();
+      const index = destination.leafId === null ? -1 : branch.findIndex(entry => entry.id === destination.leafId);
+      return (destination.leafId === null || index !== -1) &&
+        branch.slice(index + 1).every(entry => entry.type === "session_info" || entry.type === "label");
+    };
+    const describeTarget = (target: RestoreTarget) => {
+      const [preview, success] = target.kind === "baseline" ? ["restoreHereBaseline", "restoredBaseline"] as const :
+        target.nodeId === destination.leafId ? ["restoreHereCheckpoint", "restoredCheckpoint"] as const :
+        ["restoreHerePredecessor", "restoredPredecessor"] as const;
+      return { preview, success, values: { id: terminalText(target.id),
+        nodeId: target.kind === "checkpoint" ? terminalText(target.nodeId) : "" } };
+    };
     try {
-      const restored = await files.restore(destination, () => {
-        if (!active || !restorationEnabled() || generation !== restoreGeneration || !ctx.isIdle()) return false;
-        const branch = ctx.sessionManager.getBranch();
-        const index = destination.leafId === null ? -1 : branch.findIndex(entry => entry.id === destination.leafId);
-        return (destination.leafId === null || index !== -1) &&
-          branch.slice(index + 1).every(entry => entry.type === "session_info" || entry.type === "label");
-      });
-      if (!active) return;
-      const key = restored.kind === "baseline" ? "restoredBaseline" :
-        restored.nodeId === destination.leafId ? "restoredCheckpoint" : "restoredPredecessor";
-      notify(ctx, language.message(key, { id: restored.id, nodeId: restored.kind === "checkpoint" ? restored.nodeId : restored.anchorId ?? "root" }), "info");
+      if (here && !stillCurrent()) throw new VersioningError("restore_superseded", "The session is not idle.");
+      if (isFileVersioningSkipped(ctx)) throw new VersioningError("no_baseline", "File versioning was skipped at session start.");
+      const restored = await files.restore(destination, stillCurrent, here ? async target => {
+        const { preview, values } = describeTarget(target);
+        let confirmed: boolean | undefined;
+        try { confirmed = await confirmFileRestore(ctx, language, language.message(preview, values)); }
+        catch { /* A failed dialog cannot grant consent. */ }
+        if (confirmed === true) {
+          if (!stillCurrent()) throw new VersioningError("restore_superseded", "The confirmed restore is no longer current.");
+          // Only a current, approved request can supersede another restore still scanning.
+          generation = ++restoreGeneration;
+          return true;
+        }
+        if (active) {
+          if (confirmed === false) notify(ctx, language.message("restoreCancelled"), "info");
+          else reportError(ctx, language.message("restoreConfirmationUnavailable"));
+        }
+        return false;
+      } : undefined);
+      if (!active || !restored) return;
+      const { success, values } = describeTarget(restored);
+      notify(ctx, language.message(success, values), "info");
     } catch (error) {
       if (!active) return;
       const code = error instanceof VersioningError ? error.code : "restore_failed";
@@ -321,7 +370,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "tree_versioning_status", get label() { return language.message("statusLabel"); },
-    description: "Read whether automatic file restoration is currently enabled in this runtime. Returns restoreEnabled; does not scan the workspace or change files, preferences, or history. The switch controls native /tree and /fork restoration, not checkpoint collection or diff queries.",
+    description: "Read whether file restoration is currently enabled in this runtime. Returns restoreEnabled; does not scan the workspace or change files, preferences, or history. The switch controls restoration from native /tree, /fork, and the user command /tree-versioning-restore here, not checkpoint collection or diff queries.",
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     parameters: statusParameters, outputSchema: statusOutput,
     async execute() {
