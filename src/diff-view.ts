@@ -330,7 +330,7 @@ export function setRoundDiffPreview(ctx: ExtensionContext, language: Language, p
   ctx.ui.setWidget("tree-versioning.round-diff", widget);
 }
 
-function roundFileSummary(files: Comparison["files"], language: Language): string {
+function fileChangeSummary(files: Comparison["files"], language: Language): string {
   const counts = { modified: 0, added: 0, deleted: 0 };
   for (const { status } of files) {
     switch (status) {
@@ -380,7 +380,9 @@ export function diffView(value: unknown, language: Language, options: DiffViewOp
         depth: coverage.searchDepth, repositories: terminalText(JSON.stringify(coverage.repositories)),
       })));
       if (comparison.files.length === 0) lines.push(language.message("noFileChanges"));
-      else if (comparison.scope === "turn") lines.push(roundFileSummary(comparison.files, language));
+      else if (comparison.scope === "turn" || comparison.scope === "session") {
+        lines.push(fileChangeSummary(comparison.files, language));
+      }
       const inlineDiff = options.expanded ? inlineDiffer(comparison) : undefined;
       const statuses: Record<string, { label: MessageKey; color: ThemeColor }> = {
         added: { label: "fileAdded", color: "toolDiffAdded" },

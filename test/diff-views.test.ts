@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import { initTheme, SessionManager, type CustomEntry, type Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { CustomEntryComponent } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/custom-entry.js";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { dispose, fixture, git, load } from "./harness.ts";
 import { viewFixture } from "./view-fixture.ts";
 import { assertStyledCharacters, styledCharacters } from "./terminal-style.ts";
@@ -54,47 +54,57 @@ test("round cards summarize net file changes before the file list in both displa
   } finally { dispose(app.session); }
 });
 
-test("the read-only session viewer compares the baseline to the current branch without capturing disk edits", async () => {
+test("the read-only session viewer summarizes the current branch's saved net changes", async () => {
   const workspace = await fixture();
-  await writeFile(join(workspace.cwd, "notes.txt"), "existing edit\n");
+  const workspacePath = (name: string) => join(workspace.cwd, name);
+  await writeFile(workspacePath("notes.txt"), "existing edit\n");
+  await writeFile(workspacePath("reverted.txt"), "baseline content\n");
+  await writeFile(workspacePath("deleted.txt"), "to be deleted\n");
+  await writeFile(workspacePath("kind.txt"), "regular file\n");
   const view = viewFixture();
+  view.terminal.rows = 80;
   const app = await load(workspace, undefined, { mode: "tui", custom: view.custom });
   view.setTheme(app.session.extensionRunner.getUIContext().theme);
   try {
-    assert.ok(app.session.extensionRunner.getCommand("tree-versioning-diff"));
     await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
-    await writeFile(join(workspace.cwd, "notes.txt"), "common edit\n");
-    await app.session.prompt("Common round.");
-    const common = ((await app.checkpoints()).details as any).checkpoints[0];
-    await writeFile(join(workspace.cwd, "abandoned.txt"), "other branch only\n");
+    await writeFile(workspacePath("notes.txt"), "first saved edit\n");
+    await writeFile(workspacePath("reverted.txt"), "temporary change\n");
+    await app.session.prompt("First round.");
+
+    await writeFile(workspacePath("notes.txt"), "second saved edit\n");
+    await writeFile(workspacePath("reverted.txt"), "baseline content\n");
+    await writeFile(workspacePath("added.txt"), "new file\n");
+    await rm(workspacePath("deleted.txt"));
+    await rm(workspacePath("kind.txt"));
+    await symlink("notes.txt", workspacePath("kind.txt"));
+    await app.session.prompt("Second round.");
+    const { baseline, current: { snapshot: checkpoint } } = (await app.checkpoints()).details as {
+      baseline: { id: string }; current: { snapshot: { id: string; nodeId: string } };
+    };
+
+    await writeFile(workspacePath("abandoned.txt"), "other branch only\n");
     await app.session.prompt("Abandoned round.");
-    await app.session.navigateTree(common.nodeId, { summarize: false });
-    await writeFile(join(workspace.cwd, "notes.txt"), "unsnapshotted edit\n");
+    await app.session.navigateTree(checkpoint.nodeId, { summarize: false });
+    await writeFile(workspacePath("notes.txt"), "unsnapshotted edit\n");
+    await writeFile(workspacePath("unsnapshotted.txt"), "only on disk\n");
     const entries = app.manager.getEntries();
     const leaf = app.manager.getLeafId();
-    const baseline = ((await app.checkpoints()).details as any).baseline;
     const gitState = git(workspace.cwd, "status", "--porcelain");
-    let opened = false;
-    view.inspect(component => {
-      opened = true;
-      const summary = component.render(120).map(stripVTControlCharacters).join("\n");
-      assert.match(summary, /Saved session diff/);
-      assert.ok(summary.includes(baseline.id));
-      assert.ok(summary.includes(common.id));
-      assert.match(summary, /notes.txt.*\+1.*-1/);
-      assert.doesNotMatch(summary, /files? changed:|abandoned.txt|unsnapshotted edit/);
-      component.handleInput?.("\x0f");
-      const expanded = component.render(120).map(line => stripVTControlCharacters(line).trimEnd()).join("\n");
-      assert.match(expanded, /-existing edit\n\+common edit/);
-      assert.doesNotMatch(expanded, /committed|unsnapshotted edit|other branch only/);
+    await inspectSessionViewerModes(app, view, (text, expanded) => {
+      assert.match(text, /^Saved session diff\n[^\n]+\nFrom: Baseline [^\n]+\nTo: Checkpoint [^\n]+\nSession search depth: /);
+      assert.ok(text.includes(baseline.id));
+      assert.ok(text.includes(checkpoint.id));
+      assert.match(text, /^Session search depth: .+\n4 files changed: 2 modified, 1 added, 1 deleted\.\nadded\.txt · Added/m);
+      assert.match(text, /^kind\.txt · (Binary · )?Type changed/m);
+      assert.match(text, /^notes\.txt · Modified · \+1 -1/m);
+      assert.doesNotMatch(text, /No file changes|abandoned\.txt|reverted\.txt|unsnapshotted|other branch only|first saved edit|committed/);
+      if (expanded) assert.match(text, /-existing edit\n\+second saved edit/);
+      else assert.doesNotMatch(text, /^@@ /m);
     });
-    await app.session.prompt("/tree-versioning-diff");
-    assert.equal(opened, true);
-    view.verify();
     assert.deepEqual(app.manager.getEntries(), entries);
     assert.equal(app.manager.getLeafId(), leaf);
     assert.equal(git(workspace.cwd, "status", "--porcelain"), gitState);
-    assert.equal(await readFile(join(workspace.cwd, "notes.txt"), "utf8"), "unsnapshotted edit\n");
+    assert.equal(await readFile(workspacePath("notes.txt"), "utf8"), "unsnapshotted edit\n");
     assert.deepEqual(app.errors, []);
   } finally { dispose(app.session); }
 });
@@ -145,14 +155,10 @@ test("an unchanged round and a baseline-only session explicitly display an empty
   const app = await load(workspace, undefined, { mode: "tui", custom: view.custom });
   view.setTheme(app.session.extensionRunner.getUIContext().theme);
   try {
-    let opened = false;
-    view.inspect(component => {
-      opened = true;
-      assert.match(component.render(100).map(stripVTControlCharacters).join("\n"), /No file changes/);
+    await inspectSessionViewerModes(app, view, text => {
+      assert.match(text, /^Session search depth: [^\n]+\nNo file changes\.\n\S/m);
+      assert.doesNotMatch(text, /files? changed:/);
     });
-    await app.session.prompt("/tree-versioning-diff");
-    assert.equal(opened, true);
-    view.verify();
     await useModel(app, () => responseStream({ content: [{ type: "text", text: "Done." }] }));
     await app.session.prompt("An unchanged round.");
     assert.equal(cards(app).length, 1);
@@ -340,11 +346,15 @@ test("Chinese text, long paths, resizing, and paged expansion retain the full di
     let opened = false;
     view.inspect(screen => {
       opened = true;
-      assert.match(screen.render(120).map(stripVTControlCharacters).join("\n"), /ctrl\+e.*展开/);
-      screen.handleInput?.("\x05");
-      view.terminal.columns = 24;
-      view.terminal.rows = 12;
-      screen.invalidate();
+      const wide = renderPlainText(screen, 120);
+      assert.match(wide, /ctrl\+e.*展开/);
+      assert.match(wide, /覆盖仓库[^\n]+\n1 个文件有变化：新增 1 个。\n/);
+      view.sendKey("\x05");
+      view.resize(24, 60);
+      const narrow = screen.render(24);
+      assert.ok(narrow.every(line => visibleWidth(line) <= 24));
+      assert.ok(narrow.map(stripVTControlCharacters).join("").replace(/\s/g, "").includes("1个文件有变化：新增1个。"));
+      view.resize(24, 12);
       let reachedEnd = false;
       for (let page = 0; page < 1500; page++) {
         const lines = screen.render(24);
@@ -427,8 +437,27 @@ function cardComponent(app: TestApp, entry: CustomEntry, expanded = false) {
   return component;
 }
 
+function renderPlainText(component: Component, width: number) {
+  return component.render(width).map(line => stripVTControlCharacters(line).trimEnd()).join("\n");
+}
+
 function rendered(app: TestApp, entry: CustomEntry, expanded = false, width = 120) {
-  return cardComponent(app, entry, expanded).render(width).map(line => stripVTControlCharacters(line).trimEnd()).join("\n");
+  return renderPlainText(cardComponent(app, entry, expanded), width);
+}
+
+async function inspectSessionViewerModes(app: TestApp, view: ReturnType<typeof viewFixture>,
+  inspect: (text: string, expanded: boolean) => void) {
+  let opened = false;
+  view.inspect(component => {
+    opened = true;
+    const render = () => renderPlainText(component, view.terminal.columns);
+    inspect(render(), false);
+    view.sendKey("\x0f");
+    inspect(render(), true);
+  });
+  await app.session.prompt("/tree-versioning-diff");
+  assert.ok(opened, "The session diff viewer must open");
+  view.verify();
 }
 
 function assertPatchRow(lines: string[], theme: Theme, color: ThemeColor, ...spans: (string | [string])[]) {

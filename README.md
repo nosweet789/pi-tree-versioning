@@ -61,7 +61,7 @@ To view the current branch's saved total diff:
 /tree-versioning-diff
 ```
 
-The read-only viewer compares the session baseline with the current branch's saved checkpoint. Later disk edits belong to the workspace comparison described below.
+The read-only viewer compares the session baseline with the current branch's saved checkpoint. Above the file list, it shows the total number of files that differ between those endpoints and nonzero counts for modified, added, and deleted files. Type changes count as modifications in the summary. Later disk edits belong to the workspace comparison described below.
 
 The viewer opens in the bottom input area, like pi's `/tree` and `/resume`, and restores your input and focus when closed. Its panel uses at most half the terminal height, shrinking for short content or other widgets. Long diffs scroll inside the panel. Close help stays at the bottom; if the key guide is too wide, scroll to the start for the complete guide. If the terminal is too small or other widgets fill the input area, enlarge the window or reduce those widgets to see both content and controls.
 
