@@ -1,4 +1,4 @@
-import type { SessionEntry, SessionStartEvent } from "@earendil-works/pi-coding-agent";
+import type { SessionEntry, SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { isUtf8 } from "node:buffer";
 import { accessSync, constants, lstatSync, mkdirSync, readdirSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 import { formatPatch, structuredPatch } from "diff";
 import { VersioningError, type ErrorCode } from "./errors.ts";
 import { canonicalLocation, isWithin } from "./paths.ts";
-import { discoverRepositories, isRepositoryScope, repositoryCoverage, validPath, workspaceRoot, workspaceScope, type RepositoryScope } from "./repositories.ts";
+import { discoverRepositories, findWorkspaceRoot, isRepositoryScope, repositoryCoverage, validPath, workspaceRoot, workspaceScope, type RepositoryScope } from "./repositories.ts";
 
 export interface SessionPosition {
   sessionId: string;
@@ -16,6 +16,32 @@ export interface SessionPosition {
   leafId: string | null;
   entries: readonly SessionEntry[];
 }
+
+interface ForkIntent {
+  sessionId: string;
+  entryId: string;
+  position: "before" | "at";
+}
+
+interface ForkTransfer {
+  source: SessionPosition;
+  intent: ForkIntent;
+  targetSessionFile?: string;
+}
+
+type ForkAttempt =
+  | { kind: "no-history"; sessionId: string }
+  | { kind: "transfer"; sessionId: string; token: string };
+
+type TransientFork =
+  | { kind: "no-history"; sourceFile?: string; targetFile?: string }
+  | { kind: "ephemeral"; transfer: ForkTransfer; childSessionId?: string };
+
+// Pi reloads the extension module with each replacement. Only file-backed history
+// needs a durable receipt; skipped and ephemeral forks can hand off in this process.
+const forkHandoffsKey = Symbol.for("pi-tree-versioning.fork-handoffs");
+const processState = globalThis as typeof globalThis & { [forkHandoffsKey]?: Map<string, TransientFork> };
+const forkHandoffs = processState[forkHandoffsKey] ??= new Map<string, TransientFork>();
 
 interface ComparisonRequest { scope?: string; checkpointId?: string; files?: string[] }
 export type RecordedDiff = Awaited<ReturnType<SessionFiles["diff"]>> | {
@@ -240,7 +266,7 @@ function applySnapshot(root: string, current: Record<string, FileState>, target:
 
 /** Owns file collection, persistence, history coverage, comparisons, restoration, and inheritance. */
 export class SessionFiles {
-  private forkAttempt?: { sessionId: string; token: string };
+  private forkAttempt?: ForkAttempt;
 
   constructor(private readonly storageDir: string) {}
 
@@ -293,66 +319,115 @@ export class SessionFiles {
 
   async prepareFork(position: SessionPosition, entryId: string, forkPosition: "before" | "at") {
     this.forkAttempt = undefined;
-    await this.assertExternalPersistence(position, await workspaceRoot(position.cwd));
-    if (!position.sessionFile) await rm(this.transferPath(undefined, position.cwd), { force: true });
+    const baseline = await this.readBaseline(position).catch(error => {
+      if (error instanceof VersioningError && error.code === "no_baseline") return undefined;
+      throw error;
+    });
+    if (!baseline) {
+      this.forkAttempt = { kind: "no-history", sessionId: position.sessionId };
+      return;
+    }
+    // The handoff concerns immutable history. The child validates Git separately.
+    await this.savedWorkspaceDirectory(position, baseline);
+    await this.assertExternalPersistence(position, baseline.workspaceRoot);
     const token = randomUUID();
     const path = await this.storagePath(position.sessionId, true, "fork-" + token + ".json");
     await writeFile(path, JSON.stringify({ sessionId: position.sessionId, entryId, position: forkPosition }), { flag: "wx", mode: 0o600 });
-    this.forkAttempt = { sessionId: position.sessionId, token };
+    this.forkAttempt = { kind: "transfer", sessionId: position.sessionId, token };
   }
 
-  async finishFork(position: SessionPosition, targetSessionFile?: string) {
+  async shutdown(position: SessionPosition, event: SessionShutdownEvent) {
+    if (event.reason !== "fork") {
+      if (event.reason !== "reload") this.discardForkHandoff(position);
+      return;
+    }
+    const targetSessionFile = event.targetSessionFile;
+    const handoffKey = this.handoffKey(position.cwd);
+    forkHandoffs.delete(handoffKey);
     const attempt = this.forkAttempt;
     this.forkAttempt = undefined;
     if (!attempt || attempt.sessionId !== position.sessionId) return;
+    if (attempt.kind === "no-history") {
+      forkHandoffs.set(handoffKey, { kind: "no-history", sourceFile: position.sessionFile, targetFile: targetSessionFile });
+      return;
+    }
     const source = await this.storagePath(position.sessionId, false, "fork-" + attempt.token + ".json");
-    const intent = JSON.parse(await this.readRegularFile(source));
-    const destination = this.transferPath(targetSessionFile, position.cwd);
+    const intent = JSON.parse(await this.readRegularFile(source)) as ForkIntent;
+    const transfer: ForkTransfer = { source: position, intent, targetSessionFile };
+    if (!targetSessionFile) {
+      // Capture the settled source before pi reuses the ephemeral session manager.
+      await rm(source);
+      forkHandoffs.set(handoffKey, { kind: "ephemeral", transfer });
+      return;
+    }
+    const destination = this.transferPath(targetSessionFile);
     const temporary = destination + "." + attempt.token + ".tmp";
     try {
-      // Persist the settled source tree as well as intent. Ephemeral sessions have no
-      // JSONL source, and the host mutates their manager after this shutdown hook.
-      await writeFile(temporary, JSON.stringify({ source: position, intent, targetSessionFile }), { flag: "wx", mode: 0o600 });
+      await writeFile(temporary, JSON.stringify(transfer), { flag: "wx", mode: 0o600 });
       await rename(temporary, destination);
       await rm(source);
     } finally { await rm(temporary, { force: true }); }
   }
 
-  private transferPath(sessionFile: string | undefined, cwd: string) {
-    // Native pi owns one active runtime per process. File-backed replacements have
-    // a unique target path; an ephemeral replacement uses a one-shot process slot.
-    const identity = sessionFile ?? JSON.stringify({ processId: process.pid, cwd });
-    return join(this.storageDir, "transfer-" + createHash("sha256").update(identity).digest("hex") + ".json");
+  private handoffKey(cwd: string) {
+    return JSON.stringify([this.storageDir, cwd]);
   }
 
-  async initialize(position: SessionPosition, reason: SessionStartEvent["reason"] = "startup", searchDepth: (root: string) => number = () => 0) {
-    const root = await workspaceRoot(position.cwd);
-    await this.assertExternalPersistence(position, root);
-    const fork = reason === "fork";
-    // A replacement can fail before its origin marker is writable. Its durable
-    // receipt still distinguishes it from a new session when later reopened.
-    const receipt = reason !== "new" && (fork || position.sessionFile || reason === "reload") &&
-      await lstat(this.transferPath(position.sessionFile, position.cwd)).catch(error => {
-        if (error.code !== "ENOENT") throw error;
-        return undefined;
-      });
-    let restore = false;
-    if (fork || receipt) {
-      await mkdir(this.storageDir, { recursive: true, mode: 0o700 });
-      if (!(await lstat(this.storageDir)).isDirectory()) throw new Error("Snapshot storage must not traverse symbolic links");
-      // Record the origin before touching the child directory, which may be obstructed.
-      // This also covers an empty native copy with no baseline association entry.
-      await writeFile(this.path(position.sessionId, "") + ".origin.json", JSON.stringify({ inherited: true }), { flag: "wx", mode: 0o600 }).catch(error => {
-        if (error.code !== "EEXIST") throw error;
-      });
-      if (!await lstat(this.path(position.sessionId, "baseline.json")).catch(error => {
-        if (error.code !== "ENOENT") throw error;
-        return undefined;
-      })) {
-        const restoreRequested = await this.inherit(position, root);
-        restore = fork && restoreRequested;
-      }
+  private pendingEphemeralFork(position: SessionPosition) {
+    const handoff = forkHandoffs.get(this.handoffKey(position.cwd));
+    return handoff?.kind === "ephemeral" && handoff.childSessionId === position.sessionId ? handoff : undefined;
+  }
+
+  private discardForkHandoff(position: SessionPosition) {
+    if (this.pendingEphemeralFork(position)) forkHandoffs.delete(this.handoffKey(position.cwd));
+  }
+
+  private claimForkHandoff(position: SessionPosition, event: SessionStartEvent) {
+    const key = this.handoffKey(position.cwd);
+    const handoff = forkHandoffs.get(key);
+    if (!handoff) return undefined;
+    if (handoff.kind === "ephemeral" && handoff.childSessionId === position.sessionId && event.reason === "reload") return handoff;
+    forkHandoffs.delete(key);
+    if (event.reason !== "fork") return undefined;
+    if (handoff.kind === "no-history") {
+      return handoff.targetFile === position.sessionFile && handoff.sourceFile === event.previousSessionFile ? handoff : undefined;
     }
+    if (handoff.childSessionId || position.sessionFile || event.previousSessionFile) return undefined;
+    // Bind before probing Git or storage, so only this child can retry a failed start.
+    handoff.childSessionId = position.sessionId;
+    forkHandoffs.set(key, handoff);
+    return handoff;
+  }
+
+  private transferPath(sessionFile: string) {
+    return join(this.storageDir, "transfer-" + createHash("sha256").update(sessionFile).digest("hex") + ".json");
+  }
+
+  async initialize(position: SessionPosition, event: SessionStartEvent, searchDepth: (root: string) => number = () => 0) {
+    const handoff = this.claimForkHandoff(position, event);
+    const fork = event.reason === "fork" && handoff?.kind !== "no-history";
+    const ephemeral = handoff?.kind === "ephemeral" ? handoff.transfer : undefined;
+    const workspace = await findWorkspaceRoot(position.cwd).then(root => ({ root }), (error: unknown) => ({ error }));
+    const root = "root" in workspace ? workspace.root : undefined;
+    if (root !== undefined) await this.assertExternalPersistence(position, root);
+    // File-backed receipts survive interrupted initialization and reopening.
+    const receipt = event.reason !== "new" && position.sessionFile && handoff?.kind !== "no-history" ?
+      await this.receiptPath(position.sessionFile) : undefined;
+    const expectsInheritance = fork || receipt !== undefined || ephemeral !== undefined;
+    const inheritance = expectsInheritance ? await this.completeInheritance(position, root, ephemeral, receipt) : undefined;
+    if ("error" in workspace) throw workspace.error;
+    if (root === undefined) {
+      // A copied or previously saved baseline must not be mistaken for a non-Git session.
+      if (!expectsInheritance) {
+        try { await this.readBaseline(position); }
+        catch (error) {
+          if (error instanceof VersioningError && error.code === "no_baseline") return undefined;
+          throw error;
+        }
+      }
+      throw new VersioningError("workspace_mismatch", "The Git workspace for existing file history is unavailable.");
+    }
+    const restore = fork && inheritance?.restoreAfterFork === true;
     try {
       const existing = await this.load(position);
       return { baseline: existing.baseline, coverage: repositoryCoverage(existing.repositoryScope), created: !existing.inheritedCheckpoints && !fork && !this.hasBaselineRecord(position), workspaceRoot: root, restore };
@@ -386,14 +461,36 @@ export class SessionFiles {
     }
   }
 
-  private async inherit(position: SessionPosition, root: string) {
-    const receipt = this.transferPath(position.sessionFile, position.cwd);
-    const { source, intent, targetSessionFile } = JSON.parse(await this.readRegularFile(receipt)) as {
-      source: SessionPosition; intent: { sessionId: string; entryId: string; position: "before" | "at" }; targetSessionFile?: string;
-    };
-    // Consume before copying: a failed operation must not supply intent to a later
-    // ephemeral replacement, and an undeletable stale receipt is never trusted.
-    await rm(receipt);
+  private async receiptPath(sessionFile: string) {
+    const path = this.transferPath(sessionFile);
+    return await lstat(path).then(() => path, error => {
+      if (error.code !== "ENOENT") throw error;
+      return undefined;
+    });
+  }
+
+  private async completeInheritance(position: SessionPosition, root: string | undefined, ephemeral?: ForkTransfer, receipt?: string) {
+    await mkdir(this.storageDir, { recursive: true, mode: 0o700 });
+    if (!(await lstat(this.storageDir)).isDirectory()) throw new Error("Snapshot storage must not traverse symbolic links");
+    // Even a failed or empty native copy must never become a new baseline on reload.
+    await writeFile(this.path(position.sessionId, "") + ".origin.json", JSON.stringify({ inherited: true }), { flag: "wx", mode: 0o600 }).catch(error => {
+      if (error.code !== "EEXIST") throw error;
+    });
+    if (await lstat(this.path(position.sessionId, "baseline.json")).catch(error => {
+      if (error.code !== "ENOENT") throw error;
+      return undefined;
+    })) return { restoreAfterFork: false };
+
+    const transfer = ephemeral ?? (receipt ? JSON.parse(await this.readRegularFile(receipt)) as ForkTransfer : undefined);
+    if (!transfer) throw new VersioningError("snapshot_unavailable", "The fork transfer is missing.");
+    // The origin marker is already durable. Consume intent before publishing snapshots.
+    if (receipt) await rm(receipt);
+    this.discardForkHandoff(position);
+    await this.inherit(position, root, transfer);
+    return { restoreAfterFork: transfer.intent.position === "before" };
+  }
+
+  private async inherit(position: SessionPosition, availableRoot: string | undefined, { source, intent, targetSessionFile }: ForkTransfer) {
     if (!source || typeof source.sessionId !== "string" || typeof source.cwd !== "string" ||
         !Array.isArray(source.entries) || source.sessionId === position.sessionId ||
         targetSessionFile !== position.sessionFile || intent?.sessionId !== source.sessionId) {
@@ -415,8 +512,19 @@ export class SessionFiles {
         startupEntries.some(entry => entry.type !== "model_change" && entry.type !== "thinking_level_change")) {
       throw new VersioningError("snapshot_unavailable", "The copied native history does not match the fork destination.");
     }
-    const baseline = await this.load(source);
-    if (baseline.workspaceRoot !== root) throw new VersioningError("workspace_mismatch", "Cannot inherit history across workspaces.");
+    // Copying saved snapshots needs no working files. If Git is absent, require
+    // the same native cwd and retain the saved root and identities for later validation.
+    const baseline = availableRoot === undefined ? await this.readBaseline(source) : await this.load(source);
+    const root = baseline.workspaceRoot;
+    if (availableRoot !== undefined && availableRoot !== root) {
+      throw new VersioningError("workspace_mismatch", "Cannot inherit history across workspaces.");
+    }
+    if (availableRoot === undefined) {
+      if (await this.savedWorkspaceDirectory(source, baseline) !== await canonicalLocation(position.cwd)) {
+        throw new VersioningError("workspace_mismatch", "Cannot inherit history across workspaces.");
+      }
+      await this.assertExternalPersistence(position, root);
+    }
     const copiedNodes = new Set(position.entries.map(entry => entry.id));
     const copiedNode = (nodeId: string) => {
       if (copiedNodes.has(nodeId)) return nodeId;
@@ -454,10 +562,17 @@ export class SessionFiles {
     } catch (error) {
       throw new VersioningError("storage_failed", String(error));
     } finally { await rm(staging, { recursive: true, force: true }); }
-    return intent.position === "before";
   }
 
-  private async load(position: SessionPosition): Promise<Snapshot> {
+  private async savedWorkspaceDirectory(position: SessionPosition, baseline: Snapshot) {
+    const directory = await canonicalLocation(position.cwd);
+    if (!isWithin(baseline.workspaceRoot, directory)) {
+      throw new VersioningError("workspace_mismatch", "Snapshot session or workspace identity does not match.");
+    }
+    return directory;
+  }
+
+  private async readBaseline(position: SessionPosition): Promise<Snapshot> {
     let snapshot: Snapshot;
     try {
       const path = await this.storagePath(position.sessionId);
@@ -467,12 +582,24 @@ export class SessionFiles {
         if (error.code !== "ENOENT") throw error;
         return undefined;
       });
+      const recordedHistory = position.entries.some(entry => entry.type === "custom" &&
+        (entry.customType === "tree-versioning.baseline" || entry.customType === "tree-versioning.checkpoint"));
+      const missing = (error as NodeJS.ErrnoException).code === "ENOENT" && !recordedHistory && !inherited;
+      const pending = missing && (position.sessionFile ? await this.receiptPath(position.sessionFile) : this.pendingEphemeralFork(position));
       throw new VersioningError(
-        (error as NodeJS.ErrnoException).code === "ENOENT" && !this.hasBaselineRecord(position) && !inherited ? "no_baseline" : "snapshot_unavailable",
+        missing && !pending ? "no_baseline" : "snapshot_unavailable",
         "The session baseline is missing, unreadable, or corrupt.",
       );
     }
-    if (snapshot.sessionId !== position.sessionId || snapshot.workspaceRoot !== await workspaceRoot(position.cwd)) {
+    if (snapshot.sessionId !== position.sessionId) {
+      throw new VersioningError("workspace_mismatch", "Snapshot session identity does not match.");
+    }
+    return snapshot;
+  }
+
+  private async load(position: SessionPosition): Promise<Snapshot> {
+    const snapshot = await this.readBaseline(position);
+    if (snapshot.workspaceRoot !== await workspaceRoot(position.cwd)) {
       throw new VersioningError("workspace_mismatch", "Snapshot session or workspace identity does not match.");
     }
     return snapshot;

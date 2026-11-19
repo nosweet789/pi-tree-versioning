@@ -47,7 +47,9 @@ For a persistent local installation, use `pi install /absolute/path/to/pi-tree-v
 
 ## View changes
 
-On activation, the extension captures a **session baseline**, including existing uncommitted edits. Each complete processing round saves a checkpoint when pi settles and waits for input, including interruption and error stops. Steering, queued input, and automatic retries stay within the continuous round.
+In a Git working tree, the extension captures a **session baseline** on activation, including existing uncommitted edits. Each complete processing round saves a checkpoint when pi settles and waits for input, including interruption and error stops. Steering, queued input, and automatic retries stay within the continuous round.
+
+If a session starts outside a Git working tree and has no saved file history, the extension skips file versioning. Chat and native `/tree`, `/fork`, and `/clone` still work without restoring files. `/tree-versioning-diff` explains why no diff is available.
 
 Each checkpoint adds a card with changed files and addition/deletion counts. Bold paths and themed diff colors distinguish the file summary, additions, deletions, and context; status text and `+`/`-` markers remain visible. Use pi's **expand tool output** action, **Ctrl+O** by default, to inspect text patches. Binary files show change summaries. An unchanged round still gets a checkpoint and an empty-diff card.
 
@@ -82,6 +84,8 @@ With restoration **off**, `/tree` and `/fork` keep current disk files. Baseline 
 Turning restoration off invalidates pending restores that have not started writing; turning it back on cannot revive them. Turning it on does **not** restore the current position immediately or replay earlier navigation. Only subsequent navigation or forks can restore files. Switching does not interrupt a synchronous write already in progress.
 
 **Restoration directly applies the target snapshot. It overwrites unsnapshotted managed-file edits and deletes new managed files absent from the target. There is no merge, extra backup, or added confirmation. Back up important edits before navigating.**
+
+This table applies only when the session has file versioning active.
 
 | Operation | File behavior with restoration on |
 | --- | --- |

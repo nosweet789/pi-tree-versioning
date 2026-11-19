@@ -8,7 +8,7 @@ import { isLanguagePreference, Language } from "./language.ts";
 import { Preferences } from "./preferences.ts";
 import { exportOutput } from "./tool-output.ts";
 import { diffView, showDiff, terminalText } from "./diff-view.ts";
-import { isSearchDepth, workspaceRoot, type repositoryCoverage } from "./repositories.ts";
+import { findWorkspaceRoot, isSearchDepth, workspaceRoot, type repositoryCoverage } from "./repositories.ts";
 
 function position(ctx: ExtensionContext): SessionPosition {
   return {
@@ -32,8 +32,9 @@ function reportError(ctx: ExtensionContext, message: string) {
 export default async function treeVersioning(pi: ExtensionAPI) {
   const storage = join(getAgentDir(), "tree-versioning");
   const files = new SessionFiles(storage);
-  let activeWorkspaceRoot: string | undefined;
-  let activeCoverage: ReturnType<typeof repositoryCoverage> | undefined;
+  let skippedSessionId: string | undefined;
+  const isFileVersioningSkipped = (ctx: ExtensionContext) => ctx.sessionManager.getSessionId() === skippedSessionId;
+  let activeWorkspace: { root: string; coverage: ReturnType<typeof repositoryCoverage> } | undefined;
   let restoreGeneration = 0;
   let active = true;
   pi.on("session_before_fork", async (event, ctx) => {
@@ -44,10 +45,8 @@ export default async function treeVersioning(pi: ExtensionAPI) {
     active = false;
     restoreGeneration++;
     await preferences.waitForSaves();
-    if (event.reason === "fork") {
-      try { await files.finishFork(position(ctx), event.targetSessionFile); }
-      catch { reportError(ctx, language.message("inheritanceFailed")); }
-    }
+    try { await files.shutdown(position(ctx), event); }
+    catch { reportError(ctx, language.message("inheritanceFailed")); }
   });
   pi.on("before_agent_start", () => { restoreGeneration++; });
   const preferences = new Preferences(join(storage, "preferences.json"));
@@ -62,6 +61,21 @@ export default async function treeVersioning(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       if (args.trim()) {
         notify(ctx, language.message("diffHelp"), "info");
+        return;
+      }
+      if (isFileVersioningSkipped(ctx)) {
+        let root: string | undefined;
+        try { root = await findWorkspaceRoot(ctx.cwd); }
+        catch (error) {
+          reportError(ctx, language.message("query_failed") + " " + String(error));
+          return;
+        }
+        const message = language.message(root === undefined ? "diffOutsideGit" : "diffSkippedAtStartup");
+        if (ctx.hasUI) ctx.ui.notify(message, "info");
+        // An informational notice is not model output or a JSON event.
+        else await new Promise<void>((resolve, reject) => {
+          process.stderr.write(message + "\n", error => error ? reject(error) : resolve());
+        });
         return;
       }
       if (ctx.mode !== "tui") {
@@ -104,15 +118,16 @@ export default async function treeVersioning(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const choice = args.trim();
       try {
-        const root = activeWorkspaceRoot ?? await workspaceRoot(ctx.cwd);
+        const root = activeWorkspace?.root ?? await workspaceRoot(ctx.cwd);
         if (choice && /^(0|[1-9][0-9]*)$/.test(choice) && isSearchDepth(Number(choice))) {
           await preferences.saveRepositoryDepth(root, Number(choice));
           notify(ctx, language.message("repositoryDepthSaved", { depth: Number(choice) }), "info");
           return;
         }
+        const coverage = activeWorkspace?.coverage;
         notify(ctx, language.message("repositoryDepthHelp", { depth: preferences.repositoryDepth(root) }) + "\n" +
-          (activeCoverage ? language.message("repositoryCoverage", { depth: activeCoverage.searchDepth,
-            repositories: terminalText(JSON.stringify(activeCoverage.repositories)) }) : language.message("repositoryCoverageUnavailable")), "info");
+          (coverage ? language.message("repositoryCoverage", { depth: coverage.searchDepth,
+            repositories: terminalText(JSON.stringify(coverage.repositories)) }) : language.message("repositoryCoverageUnavailable")), "info");
       } catch (error) { reportError(ctx, language.message("preferences_failed") + " " + String(error)); }
     },
   });
@@ -172,20 +187,26 @@ export default async function treeVersioning(pi: ExtensionAPI) {
     if (preferenceError) notify(ctx, language.message("preferences_failed") + " " + String(preferenceError), "error");
     let restoreFork = false;
     try {
-      const initialized = await files.initialize(position(ctx), event.reason, root => preferences.repositoryDepth(root));
-      const { baseline, created, workspaceRoot } = initialized;
-      restoreFork = initialized.restore;
-      activeWorkspaceRoot = workspaceRoot;
-      activeCoverage = initialized.coverage;
-      if (created) {
-        pi.appendEntry("tree-versioning.baseline", baseline);
-        notify(ctx, language.message("baselineCreated"), "info");
+      const session = position(ctx);
+      skippedSessionId = undefined;
+      activeWorkspace = undefined;
+      const initialized = await files.initialize(session, event, root => preferences.repositoryDepth(root));
+      if (!initialized) {
+        skippedSessionId = session.sessionId;
+      } else {
+        const { baseline, created, workspaceRoot: root, coverage } = initialized;
+        restoreFork = initialized.restore;
+        activeWorkspace = { root, coverage };
+        if (created) {
+          pi.appendEntry("tree-versioning.baseline", baseline);
+          notify(ctx, language.message("baselineCreated"), "info");
+        }
+        if (coverage.searchDepth > 0) {
+          notify(ctx, language.message("repositoryCoverage", { depth: coverage.searchDepth,
+            repositories: terminalText(JSON.stringify(coverage.repositories)) }), "info");
+        }
+        notify(ctx, language.message(preferences.restoreEnabled ? "restorePolicy" : "restoreDisabled"), "info");
       }
-      if (activeCoverage.searchDepth > 0) {
-        notify(ctx, language.message("repositoryCoverage", { depth: activeCoverage.searchDepth,
-          repositories: terminalText(JSON.stringify(activeCoverage.repositories)) }), "info");
-      }
-      notify(ctx, language.message(preferences.restoreEnabled ? "restorePolicy" : "restoreDisabled"), "info");
     } catch (error) {
       const reason = error instanceof VersioningError ? language.message(error.code) : String(error);
       reportError(ctx, event.reason === "fork" ? language.message("inheritanceFailed") + " " + reason : language.message("startupFailed", { reason }));
@@ -195,6 +216,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
     if (preferenceError && !ctx.hasUI) throw new Error(language.message("preferences_failed") + " " + String(preferenceError));
   });
   pi.on("agent_settled", async (_event, ctx) => {
+    if (isFileVersioningSkipped(ctx)) return;
     let recorded: Awaited<ReturnType<SessionFiles["record"]>>;
     try {
       recorded = await files.record(position(ctx));
@@ -215,7 +237,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
   });
 
   const restore = async (destination: SessionPosition, ctx: ExtensionContext) => {
-    if (!restorationEnabled()) return;
+    if (isFileVersioningSkipped(ctx) || !restorationEnabled()) return;
     const generation = ++restoreGeneration;
     try {
       const restored = await files.restore(destination, () => {
@@ -246,7 +268,7 @@ export default async function treeVersioning(pi: ExtensionAPI) {
     const diagnostic = truncateHead(rawDiagnostic, { maxBytes: 32 * 1024, maxLines: 1500 });
     let diagnosticExport: { diagnosticPath: string } | { diagnosticExportFailed: true } | undefined;
     if (diagnostic.truncated) {
-      try { diagnosticExport = { diagnosticPath: await exportOutput(rawDiagnostic, activeWorkspaceRoot, "diagnostic.txt") }; }
+      try { diagnosticExport = { diagnosticPath: await exportOutput(rawDiagnostic, activeWorkspace?.root, "diagnostic.txt") }; }
       catch { diagnosticExport = { diagnosticExportFailed: true }; }
     }
     const details = {

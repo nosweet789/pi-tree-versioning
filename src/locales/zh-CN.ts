@@ -35,6 +35,8 @@ export const zhCN: Record<keyof typeof en, string> = {
   displayUnavailable: "已保存的差异展示数据不可用或已损坏，未显示比较结果。",
   sessionDiff: "已保存的会话总差异",
   diffCommand: "查看当前分支已保存的会话总差异",
+  diffOutsideGit: "当前目录不在 Git 工作区内，无法查看文件差异。",
+  diffSkippedAtStartup: "此会话启动时跳过了文件版本功能。请运行 /reload，在当前 Git 工作区启用。",
   diffHelp: "用法：/tree-versioning-diff。比较会话基线与当前分支已保存的检查点，不包含磁盘上未入快照的改动。查看器支持已配置的展开、滚动和关闭按键。",
   viewerRequiresTui: "差异查看器需要交互式终端模式。可用 session_diff 的 scope: session 进行只读结构化查询。",
   viewerKeys: "{close} 关闭 · {expand} 展开/折叠 · {scroll} 滚动 · {page} 翻页",

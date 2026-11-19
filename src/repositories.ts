@@ -1,7 +1,7 @@
 import { isUtf8 } from "node:buffer";
 import { execFile } from "node:child_process";
 import { lstat, opendir, realpath } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { promisify } from "node:util";
 import { canonicalLocation, isWithin } from "./paths.ts";
 
@@ -34,10 +34,11 @@ export function validPath(path: string): boolean {
 }
 
 
-async function git(cwd: string, args: string[], input?: string): Promise<string> {
-  const environment = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
+async function git(cwd: string, args: string[], { input, locale }: { input?: string; locale?: string } = {}): Promise<string> {
+  const environment: NodeJS.ProcessEnv = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
+  if (locale) environment.LC_ALL = locale;
   for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"]) {
-    delete (environment as NodeJS.ProcessEnv)[key];
+    delete environment[key];
   }
   const command = exec("git", ["-C", cwd, ...args], {
     env: environment, encoding: "buffer", maxBuffer: 64 * 1024 * 1024, timeout: 30_000,
@@ -58,8 +59,52 @@ async function git(cwd: string, args: string[], input?: string): Promise<string>
 }
 
 export async function workspaceRoot(cwd: string): Promise<string> {
-  const output = await git(cwd, ["rev-parse", "--show-toplevel"]);
+  const output = await git(cwd, ["rev-parse", "--show-toplevel"], { locale: "C" });
   return realpath(output.replace(/\r?\n$/, ""));
+}
+
+async function discoveryCeilings() {
+  const ceilings = new Set<string>();
+  let resolveSymlinks = true;
+  for (const entry of (process.env.GIT_CEILING_DIRECTORIES ?? "").split(delimiter)) {
+    // Git trusts entries after the first empty component to be free of symlinks.
+    if (!entry) { resolveSymlinks = false; continue; }
+    if (!isAbsolute(entry)) continue;
+    const ceiling = resolveSymlinks ? await realpath(entry).catch(() => undefined) :
+      entry.replace(sep === "\\" ? /[\\/]+$/ : /\/+$/, "");
+    if (ceiling) ceilings.add(ceiling);
+  }
+  return ceilings;
+}
+
+/** Initialization may skip an absent worktree, but validation of saved worktrees stays strict. */
+export async function findWorkspaceRoot(cwd: string): Promise<string | undefined> {
+  try { return await workspaceRoot(cwd); }
+  catch (error) {
+    const failure = error as { code?: number; stderr?: Buffer };
+    if (failure?.code !== 128 || !Buffer.isBuffer(failure.stderr)) throw error;
+    const diagnostic = failure.stderr.toString("utf8").trimEnd();
+    // Git discovered a repository, but it has no working tree here (e.g. a bare repository).
+    if (diagnostic === "fatal: this operation must be run in a work tree") return undefined;
+    const mount = /^fatal: not a git repository \(or any parent up to mount point (.+)\)\r?\nStopping at filesystem boundary \(GIT_DISCOVERY_ACROSS_FILESYSTEM not set\)\.$/s.exec(diagnostic);
+    if (!mount && diagnostic !== "fatal: not a git repository (or any of the parent directories): .git") throw error;
+
+    const currentDirectory = await realpath(cwd);
+    const boundary = mount ? await realpath(mount[1]!) : undefined;
+    if (boundary && !isWithin(boundary, currentDirectory)) throw error;
+    const ceilings = await discoveryCeilings();
+    // Git can report the same diagnostic for an invalid or unreadable .git directory.
+    // Git searches the current directory and mount root, but not its discovery ceiling.
+    for (let directory = currentDirectory; ; directory = dirname(directory)) {
+      if (directory !== currentDirectory && ceilings.has(directory)) return undefined;
+      const marker = await lstat(join(directory, ".git")).catch(error => {
+        if (error.code !== "ENOENT") throw error;
+        return undefined;
+      });
+      if (marker) throw error;
+      if (directory === boundary || dirname(directory) === directory) return undefined;
+    }
+  }
 }
 
 
@@ -283,7 +328,7 @@ export async function workspaceScope(root: string, saved?: RepositoryScope) {
       for (const item of repositories) {
         const targets = targetPaths.filter(path => declaredOwner(path) === item && !trackedPaths.has(path))
           .map(path => item.identity.path === "." ? path : path.slice(item.identity.path.length + 1));
-        if (targets.length && await git(item.directory, ["check-ignore", "--no-index", "-z", "--stdin"], targets.join("\0") + "\0")) {
+        if (targets.length && await git(item.directory, ["check-ignore", "--no-index", "-z", "--stdin"], { input: targets.join("\0") + "\0" })) {
           throw new Error("Restore would replace an untracked ignored path in repository: " + item.identity.path);
         }
       }

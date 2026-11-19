@@ -12,18 +12,20 @@ export function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
 }
 
-export async function fixture() {
+export async function fixture({ repository = true } = {}) {
   const root = await realpath(await mkdtemp(join(process.env.HOME!, "workspace-")));
   const cwd = join(root, "repo");
   const agentDir = join(root, "agent");
   await mkdir(cwd);
   await mkdir(agentDir);
-  git(cwd, "init", "-q");
-  git(cwd, "config", "user.email", "test@example.invalid");
-  git(cwd, "config", "user.name", "Integration Test");
   await writeFile(join(cwd, "notes.txt"), "committed\n");
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-qm", "Initial test state");
+  if (repository) {
+    git(cwd, "init", "-q");
+    git(cwd, "config", "user.email", "test@example.invalid");
+    git(cwd, "config", "user.name", "Integration Test");
+    git(cwd, "add", ".");
+    git(cwd, "commit", "-qm", "Initial test state");
+  }
   return { root, cwd, agentDir };
 }
 
