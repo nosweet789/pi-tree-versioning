@@ -1,6 +1,6 @@
 {
   "name": "pi-tree-versioning",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Workspace file checkpoints and diffs for pi sessions.",
